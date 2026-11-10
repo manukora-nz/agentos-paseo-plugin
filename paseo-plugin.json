@@ -1,0 +1,8 @@
+{
+  "id": "manukora-agentos",
+  "media": [],
+  "requirements": {
+    "paseo": ">=0.15.3"
+  },
+  "name": "Manukora AgentOS"
+}
