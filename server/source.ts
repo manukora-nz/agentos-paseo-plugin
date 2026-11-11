@@ -206,3 +206,35 @@ export async function fileReport(title: string, body: string, reporter: string) 
   if (!res.ok) throw new Error(data.error || `The report could not be filed (${res.status}).`);
   return data.number ? `#${data.number}` : "";
 }
+
+export interface TeamKeys {
+  configured: boolean;
+  roles: string[];
+  keys: Record<string, string | true>;
+  unavailable: string[];
+}
+
+// The person's team keys from Manukora's service. Names only for the setup screen; values only
+// for passing to a starting agent session, never written to disk. Cached briefly in memory.
+const keyCache = new Map<string, { at: number; value: TeamKeys }>();
+export async function teamKeys(withValues: boolean): Promise<TeamKeys | null> {
+  const service = await loadService();
+  if (!service?.identity) return null;
+  const cacheKey = withValues ? "values" : "names";
+  const hit = keyCache.get(cacheKey);
+  if (hit && Date.now() - hit.at < 5 * 60 * 1000) return hit.value;
+  try {
+    const res = await call(service, withValues ? "/v1/keys" : "/v1/keys?names=1", 10000);
+    const value = (await res.json()) as TeamKeys;
+    keyCache.set(cacheKey, { at: Date.now(), value });
+    return value;
+  } catch (error) {
+    console.error(`AgentOS key check failed: ${error instanceof Error ? error.message : error}`);
+    return null;
+  }
+}
+
+// For tests.
+export function forgetTeamKeys() {
+  keyCache.clear();
+}

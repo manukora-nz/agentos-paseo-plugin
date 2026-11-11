@@ -25,6 +25,8 @@ export interface State {
   keysOutstanding?: string;
   // The Paseo process that was running when a change needed a restart.
   restartDaemon?: number;
+  // When the weekly tune-up was scheduled, so a missed first run shows as overdue.
+  tuneUpScheduledAt?: number;
 }
 
 export async function exists(target: string) {

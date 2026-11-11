@@ -1,6 +1,6 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { identityToken } from "./server/google";
-import { loadService, refreshSource } from "./server/source";
+import { loadService, refreshSource, teamKeys } from "./server/source";
 import { bundleFile, exists, serviceFile } from "./server/util";
 import {
   applyUpdates,
@@ -44,6 +44,16 @@ export default function contribute(server: PluginServerContext) {
       const clientId = (await loadService())?.identity?.clientId;
       const token = clientId ? await identityToken(clientId) : "";
       if (token) env.AGENTOS_IDENTITY_TOKEN = token;
+      // The person's team keys (transcription, and Xero or n8n by role) reach this session only,
+      // in memory. Tools read them through run-with-env, which keeps a value already set. A key
+      // the person set in .env by hand still wins.
+      const team = token ? await teamKeys(true) : null;
+      if (team) {
+        for (const [name, value] of Object.entries(team.keys)) {
+          if (typeof value === "string" && !(name in request.env)) env[name] = value;
+        }
+        env.AGENTOS_KEYS_PROVIDED = Object.keys(team.keys).join(",");
+      }
     }
     return { ...request, env };
   });

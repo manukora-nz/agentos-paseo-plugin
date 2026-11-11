@@ -1,4 +1,4 @@
-import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { Step, StatusResult } from "../shared/contracts";
@@ -21,7 +21,7 @@ import {
 } from "./util";
 import { bundledRepo, sourceDir } from "./util";
 import { identityToken, signIn, signedInEmail } from "./google";
-import { connect, downloadAfterSignIn, fileReport, loadService, refreshSource } from "./source";
+import { connect, downloadAfterSignIn, fileReport, loadService, refreshSource, teamKeys } from "./source";
 
 // The Paseo SDK surface this plugin uses.
 export interface Paseo {
@@ -203,6 +203,36 @@ async function agentosBehind(folder: string) {
 
 const SERVICE_URL = process.env.AGENTOS_SERVICE_URL || "https://agentos.manukora.com";
 
+const KEY_LABELS: Record<string, string> = {
+  TRANSCRIPTION_API_KEY: "transcription",
+  DATADOE_MCP_KEY: "Amazon (DataDoe)",
+  XERO_MNK_CLIENT_ID: "Xero NZ",
+  XERO_MNK_CLIENT_SECRET: "",
+  XERO_ORA_CLIENT_ID: "Xero US",
+  XERO_ORA_CLIENT_SECRET: "",
+  N8N_API_KEY: "n8n",
+  NOTION_TOKEN: "full-workspace Notion",
+};
+function friendlyKey(name: string) {
+  return KEY_LABELS[name] ?? name;
+}
+
+// A Monday-morning suggestion at a minute that differs per person, so the whole team does not
+// update in the same minute.
+function suggestedTuneUp(seed: string) {
+  let h = 0;
+  for (const c of seed) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return `${5 + (h % 50)} ${9 + ((h >> 8) % 2)} * * 1`;
+}
+
+async function mtimeOf(file: string) {
+  try {
+    return (await stat(file)).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
 // On a new Mac /usr/bin/git is only a stub until Apple's developer tools are installed. Ask
 // xcode-select, which (unlike the stub) never pops up an install window by itself.
 async function appleDeveloperTools() {
@@ -366,7 +396,7 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
       ? `Ready at ${folder}.`
       : hasFolder
         ? `Found your AgentOS at ${folder}. It will be kept as it is. Change the folder if this is the wrong one.`
-        : "This is where your AgentOS lives. Nothing existing is overwritten.",
+        : "Already using AgentOS? Put its folder here and everything in it is kept: your answers, context, memory and projects, and onboarding only asks what is new. Otherwise this creates a new folder. Nothing existing is overwritten.",
     status: folderReady ? "done" : missingTools.length ? "waiting" : "todo",
     actionLabel: hasFolder ? "Use this folder" : "Create it",
     inputs: folderReady
@@ -473,21 +503,41 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
     repeatable: Boolean(conn),
   });
 
-  const opReady = ok(facts["1password-cli"]);
+  // With Manukora's service, the team's keys arrive with the person's sign-in: no 1Password token.
+  const team = service?.identity && googleEmail ? await teamKeys(false) : null;
+  const teamNames = team ? Object.keys(team.keys) : [];
+  const viaService = Boolean(service?.identity);
+  const opReady = !viaService && ok(facts["1password-cli"]);
   const tokenStored =
     opReady && live
       ? /Stored for your tools:\s*yes/i.test(
           (await run("pwsh", ["-NoProfile", "-File", "scripts/op-service-account.ps1", "-Status"], { cwd: folder, timeoutMs: 30000 })).out,
         )
       : false;
-  add({
+  if (viaService) {
+    add({
+      id: "team-keys",
+      group: "Full capability",
+      title: "Your team's keys",
+      detail: !team
+        ? "Checked once you are signed in."
+        : !team.configured
+          ? "Manukora's service is not handing out keys yet. AI & Systems is setting it up; nothing for you to do."
+          : teamNames.length
+            ? `Connected by Manukora: ${[...new Set(teamNames.map(friendlyKey).filter(Boolean))].join(", ")}. Nothing to paste; they reach AgentOS each time it starts.${team.unavailable.length ? ` Not available yet: ${[...new Set(team.unavailable.map(friendlyKey).filter(Boolean))].join(", ")}.` : ""}`
+            : "No keys arrived for your account. Ask AI & Systems.",
+      status: teamNames.includes("TRANSCRIPTION_API_KEY") ? "done" : "waiting",
+      skippable: false,
+    });
+  }
+  if (!viaService) add({
     id: "onepassword",
     group: "Full capability",
     title: "Set up 1Password",
     detail: tokenStored
       ? "Your token is stored, so tools can read the vault without prompting."
       : opReady
-        ? "The 1Password CLI is installed. Sign in with your Manukora account. Then copy your team's AgentOS service account token from 1Password (AI & Systems gives your team access) and store it here, so tools read the vault without asking each time."
+        ? "The 1Password CLI is installed. Copy your team's AgentOS token from 1Password (AI & Systems gives your team access) and store it here, so tools read the vault without asking each time."
         : "Install the 1Password CLI, then come back. Needed for transcription and role tools.",
     status: tokenStored ? "done" : live ? "needs-you" : "waiting",
     actionLabel: opReady ? "Store my token" : "Download it",
@@ -495,9 +545,9 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
     skippable: true,
   });
 
-  const keysIn = hasFolder && (await keyIsSet(folder, "TRANSCRIPTION_API_KEY"));
+  const keysIn = viaService ? teamNames.includes("TRANSCRIPTION_API_KEY") : hasFolder && (await keyIsSet(folder, "TRANSCRIPTION_API_KEY"));
   const keysSkipped = state.skipped.includes("shared-keys");
-  add({
+  if (!viaService) add({
     id: "shared-keys",
     group: "Full capability",
     title: "Bring in the shared keys",
@@ -506,7 +556,8 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
       : keysIn
         ? "Shared keys are referenced from 1Password. No values are stored in your files."
         : "Connects transcription and your role's tools to the company vault.",
-    status: state.keysOutstanding ? "needs-you" : keysIn ? "done" : !live || !opReady ? "waiting" : "todo",
+    // Waits for a stored token, not just an installed CLI, so it cannot run without one.
+    status: state.keysOutstanding ? "needs-you" : keysIn ? "done" : !live || !opReady || !tokenStored ? "waiting" : "todo",
     actionLabel: "Connect them",
     skippable: true,
   });
@@ -519,7 +570,9 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
     detail: !keysIn
       ? keysSkipped
         ? "Bring back the shared keys step to turn this on."
-        : "Turns on once the shared keys are in."
+        : viaService
+          ? "Turns on once your team's keys arrive from Manukora."
+          : "Turns on once the shared keys are in."
       : ffmpegOk
         ? "Set up. Your first real voice memo or Loom is the test."
         : "Loom screenshots need ffmpeg, which is not installed. Voice memos do not need it. Ask AI & Systems if you use Looms.",
@@ -599,20 +652,26 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
   });
   const tuneUp = /^Tune-up:\s*(.+?)\s*$/im.exec(await readIfThere(path.join(folder, "context/about-me.md")))?.[1] ?? "";
   const scheduled = live ? /"AgentOS tune-up"|AgentOS tune-up/.test((await run(paseoCli(), ["schedule", "ls", "--json"], { timeoutMs: 30000 })).out) : false;
+  // A sleeping computer misses its tune-up, so show it as overdue after eight days.
+  const lastTuneUp = scheduled ? await mtimeOf(path.join(folder, "data/tune-up/latest.md")) : 0;
+  const overdue = scheduled && Date.now() - (lastTuneUp || state.tuneUpScheduledAt || Date.now()) > 8 * 24 * 3600 * 1000;
   add({
     id: "tune-up",
     group: "Finish",
     title: "Schedule your tune-up",
-    detail: scheduled
-      ? "Your regular tune-up is scheduled. Leave your computer on at that time."
-      : "Keeps AgentOS fast and tidy, and updates it, its connections and Claude Code. Your computer needs to be on at the time you choose.",
-    status: scheduled ? "done" : live ? "todo" : "waiting",
-    actionLabel: "Schedule it",
+    detail: overdue
+      ? "Your tune-up has not run for over a week, probably because the computer was asleep. Run it now?"
+      : scheduled
+        ? "Your regular tune-up is scheduled. Leave your computer on at that time."
+        : "Keeps AgentOS fast and tidy, and updates it, its connections and Claude Code. Your computer needs to be on at the time you choose.",
+    status: overdue ? "needs-you" : scheduled ? "done" : live ? "todo" : "waiting",
+    actionLabel: overdue ? "Run it now" : "Schedule it",
     skippable: true,
+    repeatable: overdue,
     inputs: scheduled
       ? []
       : [
-          { key: "cron", label: "When (cron, e.g. 0 9 * * 1 for Mondays at 9am)", secret: false, value: tuneUp.split(/\s+/).slice(0, 5).join(" ") || "0 9 * * 1" },
+          { key: "cron", label: "When (cron; the suggestion is a Monday morning)", secret: false, value: tuneUp.split(/\s+/).slice(0, 5).join(" ") || suggestedTuneUp(folder) },
           { key: "timezone", label: "Time zone", secret: false, value: tuneUp.split(/\s+/)[5] || Intl.DateTimeFormat().resolvedOptions().timeZone },
         ],
   });
@@ -1024,6 +1083,9 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
       });
       return { message: "Downloading AgentOS." };
     case "tune-up": {
+      if ((await status(false)).steps.find((s) => s.id === "tune-up")?.status === "needs-you") {
+        return { message: "Running your tune-up now.", ...(await startAgent("/os-tune-up unattended", "AgentOS tune-up")) };
+      }
       const cron = (values.cron ?? "").trim();
       const timezone = (values.timezone ?? "").trim();
       if (!/^(\S+\s+){4}\S+$/.test(cron)) throw new Error("That schedule does not look right. Use five parts, like 0 9 * * 1.");
@@ -1038,6 +1100,9 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
           "--provider", CLAUDE_AGENT.provider, "--mode", CLAUDE_AGENT.modeId, "--cwd", folder, "/os-tune-up unattended"], { timeoutMs: 60000 }),
         "Scheduling the tune-up",
       );
+      await updateState((state) => {
+        state.tuneUpScheduledAt = Date.now();
+      });
       return { message: "Your tune-up is scheduled." };
     }
     case "resume":
