@@ -415,7 +415,7 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
       ? `Ready at ${folder}.`
       : hasFolder
         ? `Found your AgentOS at ${folder}. It will be kept as it is. Change the folder if this is the wrong one.`
-        : "Already using AgentOS? Put its folder here and everything in it is kept: your answers, context, memory and projects, and onboarding only asks what is new. Otherwise this creates a new folder. Nothing existing is overwritten.",
+        : "New to AgentOS? Leave the folder as it is, add your name and work email, and press Create it. Already using AgentOS on this computer? Put its folder in the first box instead: everything in it is kept (your answers, context, memory and projects), nothing is overwritten, and onboarding only asks what is new.",
     status: folderReady ? "done" : missingTools.length ? "waiting" : "todo",
     actionLabel: hasFolder ? "Use this folder" : "Create it",
     inputs: folderReady
