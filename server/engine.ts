@@ -1026,8 +1026,13 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
           await run("claude", ["plugin", "marketplace", "add", plugin.marketplace], { timeoutMs: 120000 });
           assertRan(await run("claude", ["plugin", "install", plugin.install], { timeoutMs: 180000 }), `Adding ${plugin.title}`);
         }
+        // Installed from the person's own AgentOS folder, which the update step keeps current.
+        const installed = (await run(paseoCli(), ["plugin", "ls"], { timeoutMs: 30000 })).out;
         for (const plugin of paseoPlugins) {
-          assertRan(await run(paseoCli(), ["plugin", "install", plugin.source], { timeoutMs: 180000 }), `Adding ${plugin.title}`);
+          if (installed.includes(plugin.id)) continue;
+          const source = path.join(folder, plugin.source);
+          if (!(await exists(path.join(source, "paseo-plugin.json")))) throw new Error(`${plugin.title} is not in your AgentOS folder yet. Run "Bring AgentOS up to date" first.`);
+          assertRan(await run(paseoCli(), ["plugin", "install", source], { timeoutMs: 180000 }), `Adding ${plugin.title}`);
         }
       });
       return { message: "Adding your plugins." };
