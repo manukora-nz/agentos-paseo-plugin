@@ -1,6 +1,18 @@
 // Windows support (beta). The Mac path uses the shell scripts under scripts/setup; a Windows PC has
 // no `sh`, so the same checks and installs are done here with winget and PowerShell.
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync } from "node:fs";
+
+// winget, and PowerShell or Python installed from the Microsoft Store, are "app execution aliases":
+// special links under WindowsApps that an ordinary existence check reports as missing. lstat sees them.
+export function commandFileExists(file: string) {
+  if (existsSync(file)) return true;
+  try {
+    lstatSync(file);
+    return true;
+  } catch {
+    return false;
+  }
+}
 import path from "node:path";
 
 export const isWindows = process.platform === "win32";
@@ -40,7 +52,7 @@ export function resolveWindowsCommand(command: string, searchPath: string, pathE
       const candidate = dir ? path.join(dir, command + ext) : command + ext;
       // A bare name with no extension is not runnable on Windows (npm ships such files for Unix).
       if (!ext && !path.extname(candidate)) continue;
-      if (existsSync(candidate)) return candidate;
+      if (commandFileExists(candidate)) return candidate;
     }
   }
   return null;

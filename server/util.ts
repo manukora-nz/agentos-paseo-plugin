@@ -138,8 +138,9 @@ export function run(
       // Windows only starts .exe files directly. Tools installed by npm (claude, codex, paseo) are
       // .cmd files, which have to go through cmd.exe with each argument quoted.
       const resolved = resolveWindowsCommand(cmd, env.PATH ?? "");
-      if (!resolved) return resolve({ code: 127, out: `${cmd} was not found on this PC.` });
-      if (isBatchFile(resolved)) {
+      // Not found by our own search: let Windows try the bare name, which also finds Store apps.
+      if (!resolved) file = cmd;
+      else if (isBatchFile(resolved)) {
         file = process.env.ComSpec || "cmd.exe";
         argv = ["/d", "/s", "/c", `"${[resolved, ...args].map(quoteForCmd).join(" ")}"`];
         verbatim = true;
@@ -159,6 +160,7 @@ export function run(
       (error, stdout, stderr) => {
         const failed = error as (NodeJS.ErrnoException & { code?: number | string }) | null;
         const code = !failed ? 0 : typeof failed.code === "number" ? failed.code : 127;
+        if (isWindows && failed?.code === "ENOENT") return resolve({ code: 127, out: `${cmd} was not found on this PC.` });
         resolve({ code, out: scrub(`${stdout}\n${stderr}`).trim() });
       },
     );
