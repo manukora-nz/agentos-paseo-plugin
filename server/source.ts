@@ -227,7 +227,8 @@ export async function teamKeys(withValues: boolean, refresh = false): Promise<Te
   const hit = withValues ? undefined : keyCache.get(who);
   if (hit && Date.now() - hit.at < 60 * 1000) return hit.value;
   try {
-    const res = await call(service, withValues ? "/v1/keys" : "/v1/keys?names=1", 10000);
+    // The service reads cold keys one at a time, so allow for several reads in a row.
+    const res = await call(service, withValues ? "/v1/keys" : "/v1/keys?names=1", 45000);
     const value = (await res.json()) as TeamKeys;
     if (!withValues && value.configured && !value.unavailable.length) keyCache.set(who, { at: Date.now(), value });
     return value;

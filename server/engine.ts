@@ -525,6 +525,8 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
           (await run("pwsh", ["-NoProfile", "-File", "scripts/op-service-account.ps1", "-Status"], { cwd: folder, timeoutMs: 30000 })).out,
         )
       : false;
+  const connectedLabels = [...new Set(teamNames.map(friendlyKey).filter(Boolean))];
+  const missingLabels = [...new Set((team?.unavailable ?? []).map(friendlyKey).filter(Boolean))];
   if (viaService) {
     add({
       id: "team-keys",
@@ -534,9 +536,11 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
         ? "Checked once you are signed in."
         : !team.configured
           ? "Manukora's service is not handing out keys yet. AI & Systems is setting it up; nothing for you to do."
-          : teamNames.length
-            ? `Connected by Manukora: ${[...new Set(teamNames.map(friendlyKey).filter(Boolean))].join(", ")}. Nothing to paste; they reach AgentOS each time it starts.${team.unavailable.length ? ` Not available yet: ${[...new Set(team.unavailable.map(friendlyKey).filter(Boolean))].join(", ")}.` : ""}`
-            : "No keys arrived for your account. Ask AI & Systems.",
+          : connectedLabels.length
+            ? `Connected by Manukora: ${connectedLabels.join(", ")}. Nothing to paste; they reach AgentOS each time it starts.${missingLabels.length ? ` Not available yet: ${missingLabels.join(", ")}.` : ""}`
+            : missingLabels.length
+              ? `Not available yet: ${missingLabels.join(", ")}. Usually temporary; tell AI & Systems if it lasts a day.`
+              : "No keys arrived for your account. Ask AI & Systems.",
       status: keysInFromService(teamNames) ? "done" : "waiting",
       skippable: false,
     });
@@ -730,7 +734,8 @@ async function roleServerPicks(folder: string, intake: string) {
     if (us || !nz) names.push("xero-ora");
   }
   if (/datadoe/i.test(picks)) names.push("datadoe");
-  if (/datahub-postgres/i.test(picks)) names.push("datahub-postgres");
+  // datahub-postgres is retired (DataHub goes through the DataHub (org) connector, AIS-278), so an
+  // old pick never turns it back on.
   if (/higgsfield/i.test(picks)) names.push("higgsfield");
   if (/better-notion/i.test(picks)) names.push("better-notion-mcp");
   if (wantsN8n(intake)) names.push("n8n-mcp");
@@ -1104,10 +1109,12 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
       return { message: "Downloading AgentOS." };
     case "tune-up": {
       if ((await status(false)).steps.find((s) => s.id === "tune-up")?.status === "needs-you") {
+        // Recorded only once the tune-up has actually started, so a failed start keeps the reminder.
+        const started = await startAgent("/os-tune-up unattended", "AgentOS tune-up");
         await updateState((state) => {
           state.tuneUpRunAt = Date.now();
         });
-        return { message: "Running your tune-up now.", ...(await startAgent("/os-tune-up unattended", "AgentOS tune-up")) };
+        return { message: "Running your tune-up now.", ...started };
       }
       const cron = (values.cron ?? "").trim();
       const timezone = (values.timezone ?? "").trim();
