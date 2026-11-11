@@ -27,6 +27,8 @@ export interface State {
   restartDaemon?: number;
   // When the weekly tune-up was scheduled, so a missed first run shows as overdue.
   tuneUpScheduledAt?: number;
+  // When the person last pressed "Run it now", so a running tune-up is not shown as overdue.
+  tuneUpRunAt?: number;
 }
 
 export async function exists(target: string) {

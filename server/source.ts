@@ -2,7 +2,7 @@
 // The plugin holds no company content; it downloads the AgentOS release as a Git bundle.
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { identityToken, signOut, type IdentityConfig } from "./google";
+import { identityToken, signedInEmail, signOut, type IdentityConfig } from "./google";
 import { bundleFile, exists, lastLines, run, serviceFile, sourceDir, stateDir } from "./util";
 
 export interface Service {
@@ -214,21 +214,25 @@ export interface TeamKeys {
   unavailable: string[];
 }
 
-// The person's team keys from Manukora's service. Names only for the setup screen; values only
-// for passing to a starting agent session, never written to disk. Cached briefly in memory.
+// The person's team keys from Manukora's service. Values are fetched fresh for every starting
+// session (never cached), so turning someone off or changing their role takes effect at once.
+// Names for the setup screen are cached for a minute per signed-in person, and only when the
+// answer is complete: an unconfigured service or a missing key is asked again next time.
 const keyCache = new Map<string, { at: number; value: TeamKeys }>();
-export async function teamKeys(withValues: boolean): Promise<TeamKeys | null> {
+export async function teamKeys(withValues: boolean, refresh = false): Promise<TeamKeys | null> {
   const service = await loadService();
   if (!service?.identity) return null;
-  const cacheKey = withValues ? "values" : "names";
-  const hit = keyCache.get(cacheKey);
-  if (hit && Date.now() - hit.at < 5 * 60 * 1000) return hit.value;
+  const who = (await signedInEmail()) || "unknown";
+  if (refresh) keyCache.delete(who);
+  const hit = withValues ? undefined : keyCache.get(who);
+  if (hit && Date.now() - hit.at < 60 * 1000) return hit.value;
   try {
     const res = await call(service, withValues ? "/v1/keys" : "/v1/keys?names=1", 10000);
     const value = (await res.json()) as TeamKeys;
-    keyCache.set(cacheKey, { at: Date.now(), value });
+    if (!withValues && value.configured && !value.unavailable.length) keyCache.set(who, { at: Date.now(), value });
     return value;
   } catch (error) {
+    keyCache.delete(who);
     console.error(`AgentOS key check failed: ${error instanceof Error ? error.message : error}`);
     return null;
   }

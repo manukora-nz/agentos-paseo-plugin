@@ -133,7 +133,12 @@ export function connectedInLine(line: string) {
 
 async function connectors(folder: string, intake: string, refresh: boolean) {
   const picks = rolePicks(intake);
-  const wanted = [...coreConnectors, ...roleConnectors.filter((name) => new RegExp(name, "i").test(picks))];
+  // Without a Grain seat there is nothing to connect, so Grain is not asked for.
+  const noGrain = /meeting_provider:\s*none/i.test(intake);
+  const wanted = [
+    ...coreConnectors.filter((name) => !(noGrain && name === "Grain")),
+    ...roleConnectors.filter((name) => new RegExp(name, "i").test(picks)),
+  ];
   const key = wanted.join(",");
   if (connectorCache && connectorCache.key === key && !refresh && Date.now() - connectorCache.at < CONNECTOR_TTL_MS) {
     return { ...connectorCache, wanted };
@@ -212,7 +217,13 @@ const KEY_LABELS: Record<string, string> = {
   XERO_ORA_CLIENT_SECRET: "",
   N8N_API_KEY: "n8n",
   NOTION_TOKEN: "full-workspace Notion",
+  N8N_API_URL: "",
+  XERO_SCOPES: "",
 };
+function keysInFromService(names: string[]) {
+  return names.includes("TRANSCRIPTION_API_KEY");
+}
+
 function friendlyKey(name: string) {
   return KEY_LABELS[name] ?? name;
 }
@@ -504,7 +515,7 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
   });
 
   // With Manukora's service, the team's keys arrive with the person's sign-in: no 1Password token.
-  const team = service?.identity && googleEmail ? await teamKeys(false) : null;
+  const team = service?.identity && googleEmail ? await teamKeys(false, refresh) : null;
   const teamNames = team ? Object.keys(team.keys) : [];
   const viaService = Boolean(service?.identity);
   const opReady = !viaService && ok(facts["1password-cli"]);
@@ -526,7 +537,7 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
           : teamNames.length
             ? `Connected by Manukora: ${[...new Set(teamNames.map(friendlyKey).filter(Boolean))].join(", ")}. Nothing to paste; they reach AgentOS each time it starts.${team.unavailable.length ? ` Not available yet: ${[...new Set(team.unavailable.map(friendlyKey).filter(Boolean))].join(", ")}.` : ""}`
             : "No keys arrived for your account. Ask AI & Systems.",
-      status: teamNames.includes("TRANSCRIPTION_API_KEY") ? "done" : "waiting",
+      status: keysInFromService(teamNames) ? "done" : "waiting",
       skippable: false,
     });
   }
@@ -545,7 +556,9 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
     skippable: true,
   });
 
-  const keysIn = viaService ? teamNames.includes("TRANSCRIPTION_API_KEY") : hasFolder && (await keyIsSet(folder, "TRANSCRIPTION_API_KEY"));
+  // A key the person already has in .env (an older 1Password setup) counts too.
+  const keysIn =
+    (viaService && teamNames.includes("TRANSCRIPTION_API_KEY")) || (hasFolder && (await keyIsSet(folder, "TRANSCRIPTION_API_KEY")));
   const keysSkipped = state.skipped.includes("shared-keys");
   if (!viaService) add({
     id: "shared-keys",
@@ -654,7 +667,14 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
   const scheduled = live ? /"AgentOS tune-up"|AgentOS tune-up/.test((await run(paseoCli(), ["schedule", "ls", "--json"], { timeoutMs: 30000 })).out) : false;
   // A sleeping computer misses its tune-up, so show it as overdue after eight days.
   const lastTuneUp = scheduled ? await mtimeOf(path.join(folder, "data/tune-up/latest.md")) : 0;
-  const overdue = scheduled && Date.now() - (lastTuneUp || state.tuneUpScheduledAt || Date.now()) > 8 * 24 * 3600 * 1000;
+  if (scheduled && !state.tuneUpScheduledAt) {
+    // Scheduled before this was recorded: start counting from now, so it can become overdue.
+    await updateState((s) => {
+      s.tuneUpScheduledAt ??= Date.now();
+    });
+  }
+  const since = Math.max(lastTuneUp, state.tuneUpScheduledAt ?? Date.now(), state.tuneUpRunAt ?? 0);
+  const overdue = scheduled && Date.now() - since > 8 * 24 * 3600 * 1000;
   add({
     id: "tune-up",
     group: "Finish",
@@ -1084,6 +1104,9 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
       return { message: "Downloading AgentOS." };
     case "tune-up": {
       if ((await status(false)).steps.find((s) => s.id === "tune-up")?.status === "needs-you") {
+        await updateState((state) => {
+          state.tuneUpRunAt = Date.now();
+        });
         return { message: "Running your tune-up now.", ...(await startAgent("/os-tune-up unattended", "AgentOS tune-up")) };
       }
       const cron = (values.cron ?? "").trim();
