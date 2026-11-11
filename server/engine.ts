@@ -56,7 +56,7 @@ const STATUS_TTL_MS = 10000;
 const CONNECTOR_TTL_MS = 30000;
 const CLAUDE_AGENT = { provider: "claude/claude-opus-5-5", modeId: "auto" };
 const SLACK_STEPS =
-  "In Chrome, open app.slack.com and press Command-Option-J. Paste this line, then copy the xoxc- value without quotes: " +
+  "In Chrome, open app.slack.com and press Command-Option-J (on Windows: Ctrl-Shift-J). Paste this line, then copy the xoxc- value without quotes: " +
   "JSON.parse(localStorage.localConfig_v2).teams[Object.keys(JSON.parse(localStorage.localConfig_v2).teams)[0]].token. " +
   "Chrome may ask you to type allow pasting first. Then open Application, Cookies, app.slack.com, and copy the value of d. Never paste these into a chat.";
 
