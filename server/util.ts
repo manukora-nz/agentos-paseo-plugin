@@ -1,8 +1,9 @@
 import { execFile } from "node:child_process";
-import { constants as fsc } from "node:fs";
+import { constants as fsc, existsSync } from "node:fs";
 import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { isBatchFile, isWindows, quoteForCmd, resolveWindowsCommand, windowsToolDirs } from "./windows";
 
 export const home = os.homedir();
 export const paseoHome = process.env.PASEO_HOME || path.join(home, ".paseo");
@@ -103,6 +104,13 @@ export async function repoRoot() {
 }
 
 export function toolEnvironment(extra: Record<string, string> = {}) {
+  if (isWindows) {
+    const dirs = [...(barePath ? [] : windowsToolDirs()), process.env.PATH ?? process.env.Path ?? ""];
+    const rest = { ...process.env };
+    // Windows names the variable "Path"; keep exactly one so the child sees ours.
+    delete rest.Path;
+    return { ...rest, PATH: dirs.join(";"), GIT_TERMINAL_PROMPT: "0", ...extra };
+  }
   const dirs = [
     path.join(home, ".local/bin"),
     ...(barePath ? [] : ["/opt/homebrew/bin", "/usr/local/bin"]),
@@ -122,14 +130,31 @@ export function run(
   options: { cwd?: string; timeoutMs?: number; extraEnvironment?: Record<string, string> } = {},
 ): Promise<RunResult> {
   return new Promise((resolve) => {
+    const env = toolEnvironment(options.extraEnvironment);
+    let file = cmd;
+    let argv = args;
+    let verbatim = false;
+    if (isWindows) {
+      // Windows only starts .exe files directly. Tools installed by npm (claude, codex, paseo) are
+      // .cmd files, which have to go through cmd.exe with each argument quoted.
+      const resolved = resolveWindowsCommand(cmd, env.PATH ?? "");
+      if (!resolved) return resolve({ code: 127, out: `${cmd} was not found on this PC.` });
+      if (isBatchFile(resolved)) {
+        file = process.env.ComSpec || "cmd.exe";
+        argv = ["/d", "/s", "/c", `"${[resolved, ...args].map(quoteForCmd).join(" ")}"`];
+        verbatim = true;
+      } else file = resolved;
+    }
     execFile(
-      cmd,
-      args,
+      file,
+      argv,
       {
         cwd: options.cwd,
         timeout: options.timeoutMs ?? 120000,
-        env: toolEnvironment(options.extraEnvironment),
+        env,
         maxBuffer: 16 * 1024 * 1024,
+        windowsHide: true,
+        windowsVerbatimArguments: verbatim,
       },
       (error, stdout, stderr) => {
         const failed = error as (NodeJS.ErrnoException & { code?: number | string }) | null;
@@ -188,8 +213,11 @@ export function lastLines(text: string, count = 3) {
 }
 
 export function paseoCli() {
-  const entry = process.argv[1] ?? "";
-  const marker = "/Resources/";
-  const at = entry.indexOf(marker);
-  return at > 0 ? path.join(entry.slice(0, at + marker.length), "bin/paseo") : "paseo";
+  const entry = (process.argv[1] ?? "").replace(/\\/g, "/");
+  const at = entry.toLowerCase().indexOf("/resources/");
+  if (at <= 0) return "paseo";
+  const bin = path.join(entry.slice(0, at + "/resources/".length), "bin");
+  if (!isWindows) return path.join(bin, "paseo");
+  for (const name of ["paseo.cmd", "paseo.exe", "paseo.bat"]) if (existsSync(path.join(bin, name))) return path.join(bin, name);
+  return "paseo";
 }

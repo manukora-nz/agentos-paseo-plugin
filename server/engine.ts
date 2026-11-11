@@ -19,6 +19,7 @@ import {
   testMode,
   updateState,
 } from "./util";
+import { CLAUDE_INSTALL_ARGS, installWindowsTools, isWindows, quoteForPowerShell, windowsPreflight } from "./windows";
 import { bundledRepo, sourceDir } from "./util";
 import { identityToken, signIn, signedInEmail } from "./google";
 import { connect, downloadAfterSignIn, fileReport, loadService, refreshSource, teamKeys } from "./source";
@@ -61,7 +62,10 @@ const SLACK_STEPS =
 
 const ok = (value?: string) => (value ?? "").startsWith("ok");
 
+const COMPUTER = isWindows ? "PC" : "Mac";
+
 async function preflight(folder: string) {
+  if (isWindows) return windowsPreflight(run, [expandHome(folder)]);
   const root = await repoRoot();
   const result = await run("sh", [path.join(root, "scripts/setup/preflight.sh"), folder], {
     cwd: root,
@@ -248,6 +252,8 @@ async function mtimeOf(file: string) {
 // xcode-select, which (unlike the stub) never pops up an install window by itself.
 async function appleDeveloperTools() {
   if (testMode && process.env.AGENTOS_TEST_NO_DEVTOOLS === "1") return false;
+  // On Windows the download only needs Git.
+  if (isWindows) return (await run("git", ["--version"], { timeoutMs: 15000 })).code === 0;
   return (await run("/usr/bin/xcode-select", ["-p"], { timeoutMs: 15000 })).code === 0;
 }
 
@@ -333,8 +339,10 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
               applyJob({
                 id: "devtools",
                 group: "Manukora",
-                title: "Install Apple developer tools",
-                detail: "AgentOS needs these to download. macOS shows an install window; it takes a few minutes.",
+                title: isWindows ? "Install Git" : "Install Apple developer tools",
+                detail: isWindows
+                  ? "AgentOS needs Git to download. This takes a minute or two; Windows may ask for permission."
+                  : "AgentOS needs these to download. macOS shows an install window; it takes a few minutes.",
                 status: "todo",
                 actionLabel: "Install",
                 skippable: false,
@@ -346,7 +354,7 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
           false,
           devTools
             ? "Press Connect, then sign in with your Manukora Google account. This downloads AgentOS and keeps it up to date."
-            : "After the developer tools, press Connect and sign in with your Manukora Google account.",
+            : `After ${isWindows ? "Git is installed" : "the developer tools"}, press Connect and sign in with your Manukora Google account.`,
         ),
       ],
       folder: state.folder ?? defaultFolder(),
@@ -376,7 +384,7 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
   const devTools = ok(facts["developer-tools"]);
   add({
     id: "tools",
-    group: "Your Mac",
+    group: `Your ${COMPUTER}`,
     title: "Install the tools AgentOS needs",
     detail:
       missingTools.length || !devTools
@@ -389,7 +397,7 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
   const claudeInstalled = ok(facts["claude-code"]);
   add({
     id: "claude-install",
-    group: "Your Mac",
+    group: `Your ${COMPUTER}`,
     title: "Install Claude Code",
     detail: claudeInstalled
       ? `Installed (${facts["claude-code"].replace("ok ", "")}).`
@@ -828,7 +836,9 @@ export function outstandingKeys(out: string) {
 async function fillSharedKeys(folder: string) {
   const shell = process.env.SHELL || "/bin/zsh";
   const out = assertRan(
-    await run(shell, ["-lc", "pwsh -NoProfile -File scripts/fill-env-from-vault.ps1 -Apply"], { cwd: folder, timeoutMs: 180000 }),
+    isWindows
+      ? await run("pwsh", ["-NoProfile", "-File", "scripts/fill-env-from-vault.ps1", "-Apply"], { cwd: folder, timeoutMs: 180000 })
+      : await run(shell, ["-lc", "pwsh -NoProfile -File scripts/fill-env-from-vault.ps1 -Apply"], { cwd: folder, timeoutMs: 180000 }),
     "Connecting shared keys",
   );
   const problems = outstandingKeys(out);
@@ -929,6 +939,13 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
   };
   const openTerminal = async (name: string, command: string, args: string[] = []) => {
     const workspace = await openWorkspace();
+    if (isWindows) {
+      // PowerShell 7 when it is there, otherwise the one built into Windows.
+      const shell = (await run("pwsh", ["-NoProfile", "-Command", "exit 0"], { timeoutMs: 15000 })).code === 0 ? "pwsh" : "powershell";
+      const line = `& ${[command, ...args].map(quoteForPowerShell).join(" ")}`;
+      await workspace.terminals.create({ name, command: shell, args: ["-NoLogo", "-NoExit", "-Command", line] });
+      return { message: `Opened ${name}. Look for the new terminal tab at the top of the window.`, workspaceId: workspace.id };
+    }
     const resolved = (await run("/usr/bin/which", [command], { timeoutMs: 10000 })).out.split("\n")[0]?.trim();
     const shell = process.env.SHELL || "/bin/zsh";
     const target = [resolved?.startsWith("/") ? resolved : command, ...args].map(quoteForShell).join(" ");
@@ -947,8 +964,16 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
 
   switch (stepId) {
     case "tools": {
-      const root = await repoRoot();
       const facts = await preflight((await loadState()).folder ?? defaultFolder());
+      if (isWindows) {
+        const missing = ["git", "node", "powershell", "python"].filter((tool) => !ok(facts[tool]));
+        startJob("tools", async () => {
+          await installWindowsTools(run, missing);
+          await markRestart();
+        });
+        return { message: "Installing. This can take a few minutes, and Windows may ask for permission." };
+      }
+      const root = await repoRoot();
       if (!ok(facts["developer-tools"])) {
         await run("xcode-select", ["--install"]);
         return { message: "macOS is showing an install window. Finish it, then press Install them again." };
@@ -965,7 +990,9 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
     case "claude-install": {
       startJob("claude-install", async () => {
         assertRan(
-          await run("bash", ["-c", "set -o pipefail; curl -fsSL https://claude.ai/install.sh | bash"], { timeoutMs: 600000 }),
+          isWindows
+            ? await run("powershell", CLAUDE_INSTALL_ARGS, { timeoutMs: 600000 })
+            : await run("bash", ["-c", "set -o pipefail; curl -fsSL https://claude.ai/install.sh | bash"], { timeoutMs: 600000 }),
           "Installing Claude Code",
         );
         await markRestart();
@@ -1078,10 +1105,16 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
       return { message: "Codex is linked to AgentOS." };
     }
     case "devtools":
+      if (isWindows) {
+        startJob("devtools", async () => {
+          await installWindowsTools(run, ["git"]);
+        });
+        return { message: "Installing Git. Windows may ask for permission. Press Check again when it finishes." };
+      }
       await run("xcode-select", ["--install"]);
       return { message: "macOS is showing an install window. Finish it, then press Check again." };
     case "connect": {
-      if (!(await appleDeveloperTools())) throw new Error("Install Apple developer tools first, using the step above.");
+      if (!(await appleDeveloperTools())) throw new Error(`Install ${isWindows ? "Git" : "Apple developer tools"} first, using the step above.`);
       const result = await connect(values.url ?? SERVICE_URL, values.key ?? "");
       invalidateStatus();
       return {

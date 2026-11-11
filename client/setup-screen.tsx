@@ -154,7 +154,7 @@ export function SetupScreen({ theme, layout, navigation }: PluginScreenProps) {
       <Text style={styles.h1}>Set up AgentOS</Text>
       <Text style={styles.muted}>
         {!data
-          ? "Checking your Mac..."
+          ? "Checking your computer..."
           : remaining
             ? `${remaining} ${remaining === 1 ? "step" : "steps"} left. Work down the list. You can come back any time.`
             : "All done. AgentOS is ready."}
