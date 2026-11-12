@@ -21,7 +21,7 @@ import {
   updateState,
 } from "./util";
 import { CLAUDE_INSTALL_ARGS, CLAUDE_WINGET_ARGS, ensureClaudeOnUserPath, installWindowsTools, isWindows, quoteForPowerShell, resolveWindowsCommand, windowsPreflight, wingetSucceeded } from "./windows";
-import { bundledRepo, sourceDir } from "./util";
+import { bundleFile, bundledRepo, sourceDir } from "./util";
 import { identityToken, signIn, signedInEmail } from "./google";
 import { connect, downloadAfterSignIn, fileReport, loadService, refreshSource, teamKeys } from "./source";
 
@@ -1067,9 +1067,12 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
       // older folders (the desktop pilot) carry an /update that refuses to update them (report #113).
       const script = path.join(await repoRoot(), ".claude", "skills", "update", "scripts", "update.ps1");
       if (!(await exists(script))) return { message: "Updating your AgentOS.", ...(await startAgent("/update", "Update AgentOS")) };
+      // Name Manukora's release explicitly: a folder whose remote is GitHub would otherwise update to
+      // GitHub main, which can be behind the release, and this step would never clear.
+      const releaseSource = (await exists(bundleFile())) ? ` -Source ${JSON.stringify(bundleFile())}` : "";
       const prompt =
         "Update this AgentOS folder to the latest Manukora release. Run exactly this command from the folder root " +
-        `and follow what it prints:\n\npwsh -NoProfile -File ${JSON.stringify(script)} -NodePath .\n\n` +
+        `and follow what it prints:\n\npwsh -NoProfile -File ${JSON.stringify(script)} -NodePath .${releaseSource}\n\n` +
         "Use this command even if this folder's own /update skill says the folder cannot be updated: that skill may be " +
         "from an older AgentOS. If the script reports conflicts with my own changes, explain them in plain words and ask " +
         "me before changing anything. When it succeeds, tell me to restart Paseo.";
