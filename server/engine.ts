@@ -20,7 +20,7 @@ import {
   toolEnvironment,
   updateState,
 } from "./util";
-import { CLAUDE_INSTALL_ARGS, ensureClaudeOnUserPath, installWindowsTools, isWindows, quoteForPowerShell, resolveWindowsCommand, windowsPreflight } from "./windows";
+import { CLAUDE_INSTALL_ARGS, CLAUDE_WINGET_ARGS, ensureClaudeOnUserPath, installWindowsTools, isWindows, quoteForPowerShell, resolveWindowsCommand, windowsPreflight, wingetSucceeded } from "./windows";
 import { bundledRepo, sourceDir } from "./util";
 import { identityToken, signIn, signedInEmail } from "./google";
 import { connect, downloadAfterSignIn, fileReport, loadService, refreshSource, teamKeys } from "./source";
@@ -177,7 +177,12 @@ function startJob(id: string, work: () => Promise<string | void>) {
 
 function applyJob(step: Step): Step {
   const current = jobs.get(step.id);
-  if (current?.running) return { ...step, status: "working", detail: "Working on it..." };
+  if (current?.running) {
+    const hint = isWindows && (step.id === "tools" || step.id === "claude-install" || step.id === "devtools")
+      ? " Windows asks for permission for each install: look for a flashing shield icon in the taskbar at the bottom of the screen, click it and choose Yes. Installs can take 5 to 10 minutes."
+      : "";
+    return { ...step, status: "working", detail: `Working on it...${hint}` };
+  }
   if (current?.error && step.status !== "done") return { ...step, status: "failed", detail: current.error };
   if (current?.note && step.status !== "done") return { ...step, detail: `${step.detail} ${current.note}` };
   return step;
@@ -424,7 +429,7 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
       ? []
       : [
           { key: "folder", label: "Folder", secret: false, value: folder },
-          { key: "name", label: hasFolder ? "Your name (only for a new folder)" : "Your name", secret: false, value: "" },
+          { key: "name", label: hasFolder ? "Your full name (only for a new folder)" : "Your full name (first and last)", secret: false, value: "" },
           { key: "email", label: hasFolder ? "Your work email (only for a new folder)" : "Your work email", secret: false, value: "" },
         ],
   });
@@ -436,8 +441,10 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
     id: "claude-signin",
     group: "AgentOS",
     title: "Sign in to Claude",
-    detail: !signedIn
-      ? "Opens a sign-in terminal. Choose your Manukora account, then type /exit."
+    detail: !claudeInstalled || !folderReady
+      ? `Waiting for ${[...(!claudeInstalled ? ["Install Claude Code"] : []), ...(!folderReady ? ["Create your AgentOS folder"] : [])].join(" and ")} above.`
+      : !signedIn
+      ? "Opens a sign-in terminal. Choose your Manukora account in the browser, and if it shows a code, paste it into the terminal and press Enter (the code does not show while you paste)."
       : onTeam
         ? `Signed in as ${account.email}.`
         : `Signed in as ${account.email ?? "an account"}, which is not the Manukora Team plan. Your connectors would read the wrong account. Switch accounts, or skip only if you know this is right.`,
@@ -462,6 +469,18 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
     actionLabel: "Update",
   });
 
+  const scaffolded = intakePhaseDone(intake, "A");
+  add({
+    id: "onboard",
+    group: "Onboarding",
+    title: "Tell AgentOS about you",
+    detail: scaffolded
+      ? "Your context is written."
+      : "A short interview about your role, priorities and tools. Takes about 15 minutes.",
+    status: scaffolded ? "done" : canStart ? "todo" : "waiting",
+    actionLabel: state.onboardAgentId ? "Go back to it" : "Start",
+  });
+
   add({
     id: "theme",
     group: "Your interface",
@@ -472,7 +491,6 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
     skippable: true,
   });
 
-  const scaffolded = intakePhaseDone(intake, "A");
   const claudeList = claudeInstalled && scaffolded ? (await run("claude", ["plugin", "list"], { timeoutMs: 30000 })).out : "";
   const paseoList = paseoPlugins.length && scaffolded ? (await run(paseoCli(), ["plugin", "ls"], { timeoutMs: 30000 })).out : "";
   const wanted = claudePlugins.filter((p) => p.when !== "n8n" || wantsN8n(intake));
@@ -493,17 +511,6 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
           : "Nothing extra needed for your role.",
     status: !scaffolded ? "waiting" : absent.length ? "todo" : "done",
     actionLabel: "Add them",
-  });
-
-  add({
-    id: "onboard",
-    group: "Onboarding",
-    title: "Tell AgentOS about you",
-    detail: scaffolded
-      ? "Your context is written."
-      : "A short interview about your role, priorities and tools. Takes about 15 minutes.",
-    status: scaffolded ? "done" : canStart ? "todo" : "waiting",
-    actionLabel: state.onboardAgentId ? "Go back to it" : "Start",
   });
 
   const live = scaffolded && Boolean(state.workspaceId);
@@ -950,8 +957,10 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
       const shell = (usePwsh ? pwshPath : resolveWindowsCommand("powershell", searchPath)) ?? "powershell.exe";
       // Re-read PATH from Windows first, so a tool installed a minute ago is found without restarting Paseo.
       const refresh = "$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User') + ';' + $env:USERPROFILE + '\\.local\\bin'";
-      const line = `${refresh}; & ${[command, ...args].map(quoteForPowerShell).join(" ")}`;
-      await workspace.terminals.create({ name, command: shell, args: ["-NoLogo", "-NoExit", "-Command", line] });
+      // The .exe or .cmd, never an npm .ps1 shim that a locked-down PC refuses to run.
+      const target = resolveWindowsCommand(command, searchPath) ?? command;
+      const line = `${refresh}; & ${[target, ...args].map(quoteForPowerShell).join(" ")}`;
+      await workspace.terminals.create({ name, command: shell, args: ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NoExit", "-Command", line] });
       return { message: `Opened ${name}. Look for the new terminal tab at the top of the window.`, workspaceId: workspace.id };
     }
     const resolved = (await run("/usr/bin/which", [command], { timeoutMs: 10000 })).out.split("\n")[0]?.trim();
@@ -997,12 +1006,18 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
     }
     case "claude-install": {
       startJob("claude-install", async () => {
-        assertRan(
-          isWindows
-            ? await run("powershell", CLAUDE_INSTALL_ARGS, { timeoutMs: 600000 })
-            : await run("bash", ["-c", "set -o pipefail; curl -fsSL https://claude.ai/install.sh | bash"], { timeoutMs: 600000 }),
-          "Installing Claude Code",
-        );
+        if (isWindows) {
+          // Anthropic's installer first; winget's Anthropic.ClaudeCode package if that fails.
+          const direct = await run("powershell", CLAUDE_INSTALL_ARGS, { timeoutMs: 600000 });
+          if (direct.code !== 0) {
+            const viaWinget = await run("winget", CLAUDE_WINGET_ARGS, { timeoutMs: 600000 });
+            if (!wingetSucceeded(viaWinget)) {
+              assertRan({ code: direct.code, out: `Anthropic installer: ${direct.out}\nwinget: ${viaWinget.out}` }, "Installing Claude Code");
+            }
+          }
+        } else {
+          assertRan(await run("bash", ["-c", "set -o pipefail; curl -fsSL https://claude.ai/install.sh | bash"], { timeoutMs: 600000 }), "Installing Claude Code");
+        }
         if (isWindows) await ensureClaudeOnUserPath(run);
         await markRestart();
       });
@@ -1056,7 +1071,8 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
         if (still) return { message: "Back to your onboarding.", agentId: state.onboardAgentId, workspaceId: state.workspaceId };
       }
       // On Windows, Paseo cannot start Claude until Claude Code's folder is on the search path.
-      if (isWindows && (await ensureClaudeOnUserPath(run))) {
+      const paseoSeesClaude = !isWindows || Boolean(resolveWindowsCommand("claude", process.env.PATH ?? ""));
+      if (isWindows && ((await ensureClaudeOnUserPath(run)) || !paseoSeesClaude)) {
         await markRestart();
         return { message: "Claude Code was added to Windows' search path. Open Task Manager, end every Paseo task, open Paseo again, then press this again." };
       }

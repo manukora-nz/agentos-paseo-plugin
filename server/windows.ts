@@ -148,7 +148,7 @@ export async function windowsPreflight(run: Runner, folders: string[]): Promise<
 // What winget calls each tool. Pinned to the major versions AgentOS supports.
 export const WINGET_IDS: Record<string, string> = {
   git: "Git.Git",
-  node: "OpenJS.NodeJS.22",
+  node: "OpenJS.NodeJS.LTS",
   powershell: "Microsoft.PowerShell",
   python: "Python.Python.3.12",
 };
@@ -161,7 +161,7 @@ export function wingetArgs(tool: string) {
 
 // winget reports "already installed" and "no newer version" with non-zero codes; both mean ready.
 export function wingetSucceeded(result: { code: number; out: string }) {
-  return result.code === 0 || /already installed|No available upgrade|No newer package/i.test(result.out);
+  return result.code === 0 || /No available upgrade found|No newer package versions are available/i.test(result.out);
 }
 
 export async function installWindowsTools(run: Runner, tools: string[]) {
@@ -172,7 +172,10 @@ export async function installWindowsTools(run: Runner, tools: string[]) {
   }
   const failed: string[] = [];
   for (const tool of tools) {
-    const result = await run("winget", wingetArgs(tool), { timeoutMs: 900000 });
+    // Install for this user first: it needs no administrator password on most PCs. Some packages only
+    // offer a whole-machine installer, so fall back to the normal install (which asks for permission).
+    let result = await run("winget", [...wingetArgs(tool), "--scope", "user"], { timeoutMs: 900000 });
+    if (!wingetSucceeded(result)) result = await run("winget", wingetArgs(tool), { timeoutMs: 900000 });
     if (!wingetSucceeded(result)) failed.push(`${tool} (${firstLine(result.out.split("\n").filter(Boolean).slice(-1)[0] ?? "") || `code ${result.code}`})`);
   }
   if (failed.length) throw new Error(`Could not install: ${failed.join(", ")}. Windows may have asked for permission in another window. Try again, or ask AI & Systems.`);
@@ -197,4 +200,7 @@ export async function ensureClaudeOnUserPath(run: Runner): Promise<boolean> {
   );
   return result.code === 0 && /added/.test(result.out);
 }
+
+// Claude Code from winget, used when Anthropic's PowerShell installer fails.
+export const CLAUDE_WINGET_ARGS = ["install", "--id", "Anthropic.ClaudeCode", "--exact", "--silent", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"];
 
