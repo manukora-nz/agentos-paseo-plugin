@@ -136,6 +136,12 @@ export function connectedInLine(line: string) {
   return /\bconnected\b/i.test(line);
 }
 
+function pluginState(list: string, id: string): "running" | "failed" | "absent" {
+  const line = list.split("\n").find((l) => l.trim().split(/\s+/)[0] === id);
+  if (!line) return "absent";
+  return /\bfailed\b/i.test(line) ? "failed" : "running";
+}
+
 async function connectors(folder: string, intake: string, refresh: boolean) {
   const picks = rolePicks(intake);
   // Without a Grain seat there is nothing to connect, so Grain is not asked for.
@@ -145,20 +151,34 @@ async function connectors(folder: string, intake: string, refresh: boolean) {
     ...roleConnectors.filter((name) => new RegExp(name, "i").test(picks)),
   ];
   const key = wanted.join(",");
-  if (connectorCache && connectorCache.key === key && !refresh && Date.now() - connectorCache.at < CONNECTOR_TTL_MS) {
-    return { ...connectorCache, wanted };
+  const known = connectorCache && connectorCache.key === key ? connectorCache : null;
+  if (known && !refresh && Date.now() - known.at < CONNECTOR_TTL_MS) return { ...known, wanted, checking: false };
+  // `claude mcp list` probes every connector on the account; with many organisation connectors it
+  // takes 30 seconds or more, longer than Paseo waits for this screen. Run it in the background and
+  // show the last result (or "checking") meanwhile.
+  if (!connectorRun) {
+    connectorRun = run("claude", ["mcp", "list"], { cwd: folder, timeoutMs: 120000 })
+      .then((result) => {
+        const connected: string[] = [];
+        const missing: string[] = [];
+        for (const name of wanted) {
+          const line = result.out.split("\n").find((l) => new RegExp(`claude\\.ai .*${name}`, "i").test(l));
+          if (line && connectedInLine(line)) connected.push(name);
+          else missing.push(name);
+        }
+        connectorCache = { at: Date.now(), connected, missing, key };
+      })
+      .finally(() => {
+        connectorRun = null;
+        invalidateStatus();
+      });
   }
-  const result = await run("claude", ["mcp", "list"], { cwd: folder, timeoutMs: 90000 });
-  const connected: string[] = [];
-  const missing: string[] = [];
-  for (const name of wanted) {
-    const line = result.out.split("\n").find((l) => new RegExp(`claude\\.ai .*${name}`, "i").test(l));
-    if (line && connectedInLine(line)) connected.push(name);
-    else missing.push(name);
-  }
-  connectorCache = { at: Date.now(), connected, missing, key };
-  return { ...connectorCache, wanted };
+  if (testMode) await connectorRun;
+  const now = connectorCache && connectorCache.key === key ? connectorCache : null;
+  if (now) return { ...now, wanted, checking: Boolean(connectorRun) && !testMode };
+  return { at: 0, connected: [] as string[], missing: [] as string[], key, wanted, checking: true };
 }
+let connectorRun: Promise<void> | null = null;
 
 async function keyIsSet(folder: string, key: string) {
   const text = await readIfThere(path.join(folder, ".env"));
@@ -188,7 +208,18 @@ function applyJob(step: Step): Step {
   return step;
 }
 
+let lastShown: StatusResult | null = null;
+const STATUS_BUDGET_MS = 20000;
 export async function status(refresh: boolean): Promise<StatusResult> {
+  const full = statusNow(refresh).then((value) => (lastShown = value));
+  if (!lastShown || testMode) return full;
+  // Paseo gives up on a slow plugin call. Answer with the last result; the check carries on and the
+  // next poll shows it.
+  const previous = lastShown;
+  return Promise.race([full, new Promise<StatusResult>((resolve) => setTimeout(() => resolve(previous), STATUS_BUDGET_MS).unref?.())]);
+}
+
+async function statusNow(refresh: boolean): Promise<StatusResult> {
   if (statusInFlight && statusInFlight.generation === generation && (statusInFlight.refresh || !refresh)) {
     return statusInFlight.promise;
   }
@@ -496,7 +527,7 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
   const wanted = claudePlugins.filter((p) => p.when !== "n8n" || wantsN8n(intake));
   const absent = [
     ...wanted.filter((p) => !claudeList.includes(p.id)).map((p) => p.title),
-    ...paseoPlugins.filter((p) => !paseoList.includes(p.id)).map((p) => p.title),
+    ...paseoPlugins.filter((p) => pluginState(paseoList, p.id) !== "running").map((p) => p.title),
   ];
   add({
     id: "plugins",
@@ -521,10 +552,12 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
     title: "Connect your accounts",
     detail: !conn
       ? "Notion, Slack, Gmail, Calendar, Drive, Grain and the tools for your role."
+      : conn.checking && !conn.at
+        ? "Checking your connected accounts in the background. With many connectors this takes up to a minute; the screen updates by itself."
       : conn.missing.length
         ? `Connected: ${conn.connected.length} of ${conn.wanted.length}. Still to do: ${conn.missing.join(", ")}. Turn each on at claude.ai, Settings, Customize, Connectors. Then in the terminal choose Yes if asked, type /mcp, sign in to each and type /exit. Press Check again when you are done.`
         : "All your accounts are connected.",
-    status: !conn ? "waiting" : conn.missing.length ? "needs-you" : "done",
+    status: !conn ? "waiting" : conn.checking && !conn.at ? "working" : conn.missing.length ? "needs-you" : "done",
     actionLabel: "Open sign-in terminal",
     link: "https://claude.ai/new#customize/connectors",
     skippable: true,
@@ -1064,7 +1097,10 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
         // Installed from the person's own AgentOS folder, which the update step keeps current.
         const installed = (await run(paseoCli(), ["plugin", "ls"], { timeoutMs: 30000 })).out;
         for (const plugin of paseoPlugins) {
-          if (installed.includes(plugin.id)) continue;
+          const state = pluginState(installed, plugin.id);
+          if (state === "running") continue;
+          // A broken copy with the same id (left by the desktop pilot) is replaced.
+          if (state === "failed") await run(paseoCli(), ["plugin", "remove", plugin.id], { timeoutMs: 60000 });
           const source = path.join(folder, plugin.source);
           if (!(await exists(path.join(source, "paseo-plugin.json")))) throw new Error(`${plugin.title} is not in your AgentOS folder yet. Run "Bring AgentOS up to date" first.`);
           assertRan(await run(paseoCli(), ["plugin", "install", source], { timeoutMs: 180000 }), `Adding ${plugin.title}`);
