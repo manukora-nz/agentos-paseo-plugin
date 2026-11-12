@@ -102,7 +102,7 @@ export async function windowsPreflight(run: Runner, folders: string[]): Promise<
   facts.git = git ? `ok ${git.replace(/^git version\s*/, "")}` : "missing";
 
   if (!node) facts.node = "missing";
-  else facts.node = [22, 24].includes(versionParts(node)[0]) ? `ok ${node}` : `needs-attention ${node} (Node 22 or 24 is required)`;
+  else facts.node = versionParts(node)[0] >= 22 ? `ok ${node}` : `needs-attention ${node} (Node 22 or later is required)`;
 
   if (!pwsh) facts.powershell = "missing";
   else facts.powershell = versionParts(pwsh)[0] >= 7 ? `ok ${pwsh}` : `needs-attention ${pwsh}`;
