@@ -180,3 +180,21 @@ export async function installWindowsTools(run: Runner, tools: string[]) {
 
 // Anthropic's installer for Windows.
 export const CLAUDE_INSTALL_ARGS = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "irm https://claude.ai/install.ps1 | iex"];
+
+// Claude Code installs to %USERPROFILE%\.local\bin, which Windows does not always add to the user's search
+// path. Paseo then shows Claude as "Unavailable". Adds the folder once; returns true when it was added,
+// which means Paseo has to be fully restarted to see it.
+export async function ensureClaudeOnUserPath(run: Runner): Promise<boolean> {
+  const dir = path.join(home, ".local", "bin");
+  if (!existsSync(path.join(dir, "claude.exe"))) return false;
+  const script =
+    "$d = $env:AGENTOS_CLAUDE_DIR; $p = [Environment]::GetEnvironmentVariable('Path','User'); " +
+    "if (-not $p) { $p = '' }; " +
+    "if ($p -split ';' | Where-Object { $_.TrimEnd('\\') -ieq $d.TrimEnd('\\') }) { 'present' } " +
+    "else { [Environment]::SetEnvironmentVariable('Path', ($p.TrimEnd(';') + ';' + $d).TrimStart(';'), 'User'); 'added' }";
+  const result = await (run as unknown as (cmd: string, args: string[], options: { timeoutMs?: number; extraEnvironment?: Record<string, string> }) => Promise<{ code: number; out: string }>)(
+    "powershell", ["-NoProfile", "-NonInteractive", "-Command", script], { timeoutMs: 30000, extraEnvironment: { AGENTOS_CLAUDE_DIR: dir } },
+  );
+  return result.code === 0 && /added/.test(result.out);
+}
+

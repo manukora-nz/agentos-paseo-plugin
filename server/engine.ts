@@ -20,7 +20,7 @@ import {
   toolEnvironment,
   updateState,
 } from "./util";
-import { CLAUDE_INSTALL_ARGS, installWindowsTools, isWindows, quoteForPowerShell, resolveWindowsCommand, windowsPreflight } from "./windows";
+import { CLAUDE_INSTALL_ARGS, ensureClaudeOnUserPath, installWindowsTools, isWindows, quoteForPowerShell, resolveWindowsCommand, windowsPreflight } from "./windows";
 import { bundledRepo, sourceDir } from "./util";
 import { identityToken, signIn, signedInEmail } from "./google";
 import { connect, downloadAfterSignIn, fileReport, loadService, refreshSource, teamKeys } from "./source";
@@ -1003,6 +1003,7 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
             : await run("bash", ["-c", "set -o pipefail; curl -fsSL https://claude.ai/install.sh | bash"], { timeoutMs: 600000 }),
           "Installing Claude Code",
         );
+        if (isWindows) await ensureClaudeOnUserPath(run);
         await markRestart();
       });
       return { message: "Installing Claude Code." };
@@ -1053,6 +1054,11 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
           .refresh()
           .catch(() => null);
         if (still) return { message: "Back to your onboarding.", agentId: state.onboardAgentId, workspaceId: state.workspaceId };
+      }
+      // On Windows, Paseo cannot start Claude until Claude Code's folder is on the search path.
+      if (isWindows && (await ensureClaudeOnUserPath(run))) {
+        await markRestart();
+        return { message: "Claude Code was added to Windows' search path. Open Task Manager, end every Paseo task, open Paseo again, then press this again." };
       }
       const launched = await startAgent("/onboard", "AgentOS onboarding");
       await updateState((next) => {
