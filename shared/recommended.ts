@@ -17,7 +17,7 @@ export const paseoPlugins: readonly { id: string; title: string; source: string 
   { id: "skills-library", title: "Skills library", source: "paseo-plugins/skills-library" },
 ];
 
-export const roleConnectors = ["Shopify", "Cin7", "Klaviyo", "Gorgias", "DataHub"] as const;
+export const roleConnectors = ["Shopify", "Cin7", "Klaviyo", "Gorgias"] as const;
 
 export const coreConnectors = [
   "Notion",
@@ -26,4 +26,6 @@ export const coreConnectors = [
   "Google Calendar",
   "Google Drive",
   "Grain",
+  // Open to everyone since Scott connected DataHub's WorkOS sign-in to the whole organisation (12 Nov 2026).
+  "DataHub (org)",
 ] as const;

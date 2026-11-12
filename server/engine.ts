@@ -162,7 +162,7 @@ async function connectors(folder: string, intake: string, refresh: boolean) {
         const connected: string[] = [];
         const missing: string[] = [];
         for (const name of wanted) {
-          const line = result.out.split("\n").find((l) => new RegExp(`claude\\.ai .*${name}`, "i").test(l));
+          const line = result.out.split("\n").find((l) => new RegExp(`claude\\.ai .*${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i").test(l));
           if (line && connectedInLine(line)) connected.push(name);
           else missing.push(name);
         }
