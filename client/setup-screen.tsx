@@ -167,7 +167,7 @@ export function SetupScreen({ theme, layout, navigation }: PluginScreenProps) {
       {data?.restartNeeded ? (
         <View style={styles.banner}>
           <Text style={styles.bannerText}>
-            Fully quit Paseo with Command-Q and open it again so these changes take effect. Your progress is saved.
+            {(typeof navigator !== "undefined" && /Win/i.test(navigator.platform || navigator.userAgent || "")) ? "Fully quit Paseo (right-click its icon in the taskbar tray and choose Quit) and open it again so these changes take effect. Your progress is saved." : "Fully quit Paseo with Command-Q and open it again so these changes take effect. Your progress is saved."}
           </Text>
         </View>
       ) : null}

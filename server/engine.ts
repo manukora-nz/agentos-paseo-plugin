@@ -17,9 +17,10 @@ import {
   run,
   scrubValues,
   testMode,
+  toolEnvironment,
   updateState,
 } from "./util";
-import { CLAUDE_INSTALL_ARGS, installWindowsTools, isWindows, quoteForPowerShell, windowsPreflight } from "./windows";
+import { CLAUDE_INSTALL_ARGS, installWindowsTools, isWindows, quoteForPowerShell, resolveWindowsCommand, windowsPreflight } from "./windows";
 import { bundledRepo, sourceDir } from "./util";
 import { identityToken, signIn, signedInEmail } from "./google";
 import { connect, downloadAfterSignIn, fileReport, loadService, refreshSource, teamKeys } from "./source";
@@ -941,8 +942,14 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
     const workspace = await openWorkspace();
     if (isWindows) {
       // PowerShell 7 when it is there, otherwise the one built into Windows.
-      const shell = (await run("pwsh", ["-NoProfile", "-Command", "exit 0"], { timeoutMs: 15000 })).code === 0 ? "pwsh" : "powershell";
-      const line = `& ${[command, ...args].map(quoteForPowerShell).join(" ")}`;
+      // Full path to the shell, so the terminal never depends on how Paseo searches PATH.
+      const searchPath = String(toolEnvironment().PATH ?? "");
+      const pwshPath = resolveWindowsCommand("pwsh", searchPath);
+      const usePwsh = pwshPath ? (await run(pwshPath, ["-NoProfile", "-Command", "exit 0"], { timeoutMs: 15000 })).code === 0 : false;
+      const shell = (usePwsh ? pwshPath : resolveWindowsCommand("powershell", searchPath)) ?? "powershell.exe";
+      // Re-read PATH from Windows first, so a tool installed a minute ago is found without restarting Paseo.
+      const refresh = "$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User') + ';' + $env:USERPROFILE + '\\.local\\bin'";
+      const line = `${refresh}; & ${[command, ...args].map(quoteForPowerShell).join(" ")}`;
       await workspace.terminals.create({ name, command: shell, args: ["-NoLogo", "-NoExit", "-Command", line] });
       return { message: `Opened ${name}. Look for the new terminal tab at the top of the window.`, workspaceId: workspace.id };
     }
