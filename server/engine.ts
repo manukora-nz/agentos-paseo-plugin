@@ -210,13 +210,38 @@ function applyJob(step: Step): Step {
 
 let lastShown: StatusResult | null = null;
 const STATUS_BUDGET_MS = 20000;
-export async function status(refresh: boolean): Promise<StatusResult> {
+export const STILL_CHECKING_ID = "still-checking";
+async function stillChecking(): Promise<StatusResult> {
+  const state = await loadState().catch(() => ({ folder: undefined, workspaceId: undefined }) as Awaited<ReturnType<typeof loadState>>);
+  return {
+    steps: [
+      {
+        id: STILL_CHECKING_ID,
+        group: "Checking",
+        title: "Still checking your computer",
+        detail: "This first check can take up to a minute. The list appears here on its own.",
+        status: "working",
+        skippable: false,
+        repeatable: false,
+        inputs: [],
+      },
+    ],
+    folder: state.folder ?? defaultFolder(),
+    workspaceId: state.workspaceId,
+    restartNeeded: false,
+  };
+}
+
+export async function status(refresh: boolean, budgetMs = STATUS_BUDGET_MS): Promise<StatusResult> {
   const full = statusNow(refresh).then((value) => (lastShown = value));
-  if (!lastShown || testMode) return full;
-  // Paseo gives up on a slow plugin call. Answer with the last result; the check carries on and the
-  // next poll shows it.
+  if (testMode && budgetMs === STATUS_BUDGET_MS) return full;
+  // Paseo gives up on a slow plugin call. Answer within the budget: with the last result, or on the
+  // first load a "still checking" placeholder. The check carries on and the next poll shows it.
   const previous = lastShown;
-  return Promise.race([full, new Promise<StatusResult>((resolve) => setTimeout(() => resolve(previous), STATUS_BUDGET_MS).unref?.())]);
+  return Promise.race([
+    full,
+    new Promise<StatusResult>((resolve) => setTimeout(() => resolve(previous ?? stillChecking()), budgetMs).unref?.()),
+  ]);
 }
 
 async function statusNow(refresh: boolean): Promise<StatusResult> {

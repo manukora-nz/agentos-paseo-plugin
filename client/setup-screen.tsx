@@ -74,6 +74,14 @@ export function SetupScreen({ theme, layout, navigation }: PluginScreenProps) {
     };
   }, [refresh]);
 
+  // The first check can outlast Paseo's call limit; the server then answers "still checking".
+  const stillChecking = data?.steps.some((s) => s.id === "still-checking") ?? false;
+  useEffect(() => {
+    if (!stillChecking) return;
+    const soon = setTimeout(() => void refresh(), 5000);
+    return () => clearTimeout(soon);
+  }, [stillChecking, data, refresh]);
+
   const colors = theme.colors;
   const styles = useMemo(
     () => ({
