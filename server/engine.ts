@@ -53,8 +53,8 @@ function invalidateStatus() {
   statusCache = null;
 }
 
-const STATUS_TTL_MS = 10000;
-const CONNECTOR_TTL_MS = 30000;
+const STATUS_TTL_MS = 20000;
+const CONNECTOR_TTL_MS = 120000;
 const CLAUDE_AGENT = { provider: "claude/claude-opus-5-5", modeId: "auto" };
 const SLACK_STEPS =
   "In Chrome, open app.slack.com and press Command-Option-J (on Windows: Ctrl-Shift-J). Paste this line, then copy the xoxc- value without quotes: " +
@@ -190,9 +190,10 @@ export async function status(refresh: boolean): Promise<StatusResult> {
   if (!refresh && statusCache && Date.now() - statusCache.at < STATUS_TTL_MS) return statusCache.value;
   const startedGeneration = generation;
   const promise: Promise<StatusResult> = computeStatus(refresh)
-    .then((value): StatusResult | Promise<StatusResult> => {
-      if (startedGeneration !== generation) return status(refresh);
-      statusCache = { at: Date.now(), value };
+    .then((value): StatusResult => {
+      // A button press during this check does not restart it (restarting made presses wait behind
+      // repeated slow checks). Show this result now; it is not cached, so the next poll re-checks.
+      if (startedGeneration === generation) statusCache = { at: Date.now(), value };
       return value;
     })
     .finally(() => {

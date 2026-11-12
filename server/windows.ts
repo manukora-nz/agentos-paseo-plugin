@@ -90,19 +90,25 @@ export async function windowsPreflight(run: Runner, folders: string[]): Promise<
     return result.code === 0 ? firstLine(result.out) : "";
   };
 
-  const git = await version("git", ["--version"]);
+  // Each check starts a process, which is slow on Windows; run them together.
+  const [git, node, pwsh, pythonDirect, op, claude] = await Promise.all([
+    version("git", ["--version"]),
+    version("node", ["--version"]),
+    version("pwsh", ["-NoProfile", "-NonInteractive", "-Command", "$PSVersionTable.PSVersion.ToString()"]),
+    version("python", ["--version"]),
+    version("op", ["--version"]),
+    version("claude", ["--version"]),
+  ]);
   facts.git = git ? `ok ${git.replace(/^git version\s*/, "")}` : "missing";
 
-  const node = await version("node", ["--version"]);
   if (!node) facts.node = "missing";
   else facts.node = [22, 24].includes(versionParts(node)[0]) ? `ok ${node}` : `needs-attention ${node} (Node 22 or 24 is required)`;
 
-  const pwsh = await version("pwsh", ["-NoProfile", "-NonInteractive", "-Command", "$PSVersionTable.PSVersion.ToString()"]);
   if (!pwsh) facts.powershell = "missing";
   else facts.powershell = versionParts(pwsh)[0] >= 7 ? `ok ${pwsh}` : `needs-attention ${pwsh}`;
 
   // The Microsoft Store placeholder answers "python" without being Python, so ask for a version.
-  const python = (await version("python", ["--version"])) || (await version("py", ["-3", "--version"]));
+  const python = /Python \d/.test(pythonDirect) ? pythonDirect : await version("py", ["-3", "--version"]);
   if (!/Python \d/.test(python)) facts.python = "missing";
   else {
     const [major, minor] = versionParts(python);
@@ -110,10 +116,8 @@ export async function windowsPreflight(run: Runner, folders: string[]): Promise<
     facts.python = major === 3 && minor >= 10 ? `ok ${shown}` : `needs-attention ${shown} (Python 3.10 or later is required)`;
   }
 
-  const op = await version("op", ["--version"]);
   facts["1password-cli"] = op ? `ok ${op}` : "missing";
 
-  const claude = await version("claude", ["--version"]);
   if (claude) {
     facts["claude-code"] = `ok ${claude.split(" ")[0]}`;
     const status = await run("claude", ["auth", "status"], { timeoutMs: 30000 });

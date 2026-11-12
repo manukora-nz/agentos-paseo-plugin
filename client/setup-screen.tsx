@@ -67,7 +67,7 @@ export function SetupScreen({ theme, layout, navigation }: PluginScreenProps) {
   useEffect(() => {
     alive.current = true;
     void refresh();
-    const timer = setInterval(() => void refresh(), 15000);
+    const timer = setInterval(() => void refresh(), 30000);
     return () => {
       alive.current = false;
       clearInterval(timer);
@@ -125,7 +125,7 @@ export function SetupScreen({ theme, layout, navigation }: PluginScreenProps) {
       setNotice(err instanceof Error ? err.message : String(err));
     }
     setBusy("");
-    void refresh(true);
+    void refresh();
   }
 
   async function submitReport() {
