@@ -1029,8 +1029,19 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
       await openWorkspace();
       return { message: `AgentOS is ready at ${await currentFolder()}. Carry on down the list.` };
     }
-    case "agentos-update":
-      return { message: "Updating your AgentOS.", ...(await startAgent("/update", "Update AgentOS")) };
+    case "agentos-update": {
+      // Run the update script from the release Manukora just sent, not the folder's own /update:
+      // older folders (the desktop pilot) carry an /update that refuses to update them (report #113).
+      const script = path.join(await repoRoot(), ".claude", "skills", "update", "scripts", "update.ps1");
+      if (!(await exists(script))) return { message: "Updating your AgentOS.", ...(await startAgent("/update", "Update AgentOS")) };
+      const prompt =
+        "Update this AgentOS folder to the latest Manukora release. Run exactly this command from the folder root " +
+        `and follow what it prints:\n\npwsh -NoProfile -File ${JSON.stringify(script)} -NodePath .\n\n` +
+        "Use this command even if this folder's own /update skill says the folder cannot be updated: that skill may be " +
+        "from an older AgentOS. If the script reports conflicts with my own changes, explain them in plain words and ask " +
+        "me before changing anything. When it succeeds, tell me to restart Paseo.";
+      return { message: "Updating your AgentOS.", ...(await startAgent(prompt, "Update AgentOS")) };
+    }
     case "claude-signin":
       return openTerminal("Claude sign-in", "claude", ["auth", "login"]);
     case "theme":
