@@ -580,7 +580,7 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
       : conn.checking && !conn.at
         ? "Checking your connected accounts in the background. With many connectors this takes up to a minute; the screen updates by itself."
       : conn.missing.length
-        ? `Connected: ${conn.connected.length} of ${conn.wanted.length}. Still to do: ${conn.missing.join(", ")}. Turn each on at claude.ai, Settings, Customize, Connectors. Then in the terminal choose Yes if asked, type /mcp, sign in to each and type /exit. Press Check again when you are done.`
+        ? `Connected: ${conn.connected.length} of ${conn.wanted.length}. Still to do: ${conn.missing.join(", ")}. Turn each on at claude.ai, Settings, Customize, Connectors. Then in the terminal choose Yes if asked, type /mcp, sign in to each and type /exit. Press Check again when you are done. Not using one of these (for example Slack)? Press Skip for now: the rest of setup carries on, and this step turns Done by itself once everything is connected.`
         : "All your accounts are connected.",
     status: !conn ? "waiting" : conn.checking && !conn.at ? "working" : conn.missing.length ? "needs-you" : "done",
     actionLabel: "Open sign-in terminal",
