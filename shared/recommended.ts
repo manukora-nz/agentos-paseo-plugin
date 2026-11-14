@@ -15,6 +15,7 @@ export const paseoPlugins: readonly { id: string; title: string; source: string 
   { id: "usage-meter", title: "Usage remaining", source: "paseo-plugins/usage-meter" },
   { id: "awaiting-you", title: "Awaiting you", source: "paseo-plugins/awaiting-you" },
   { id: "skills-library", title: "Skills library", source: "paseo-plugins/skills-library" },
+  { id: "keep-awake", title: "Keep awake while agents work", source: "paseo-plugins/keep-awake" },
 ];
 
 export const roleConnectors = ["Shopify", "Cin7", "Klaviyo", "Gorgias"] as const;
