@@ -1,5 +1,6 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { identityToken } from "./server/google";
+import { keepInboxFresh } from "./server/inbox";
 import { loadService, refreshSource, teamKeys } from "./server/source";
 import { bundleFile, exists, serviceFile } from "./server/util";
 import {
@@ -57,5 +58,9 @@ export default function contribute(server: PluginServerContext) {
     }
     return { ...request, env };
   });
-  return () => {};
+  // "Shared with you" in the Skills library: refreshed every 15 minutes in the background.
+  const stopInbox = keepInboxFresh();
+  return () => {
+    stopInbox();
+  };
 }

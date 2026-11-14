@@ -1,4 +1,4 @@
-import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { Step, StatusResult } from "../shared/contracts";
@@ -21,7 +21,7 @@ import {
   updateState,
 } from "./util";
 import { CLAUDE_INSTALL_ARGS, CLAUDE_WINGET_ARGS, ensureClaudeOnUserPath, installWindowsTools, isWindows, quoteForPowerShell, resolveWindowsCommand, windowsPreflight, wingetSucceeded } from "./windows";
-import { bundleFile, bundledRepo, sourceDir } from "./util";
+import { bundleFile, bundledRepo, sourceDir, stateDir } from "./util";
 import { identityToken, signIn, signedInEmail } from "./google";
 import { connect, downloadAfterSignIn, fileReport, loadService, refreshSource, teamKeys } from "./source";
 
@@ -167,6 +167,12 @@ async function connectors(folder: string, intake: string, refresh: boolean) {
           else missing.push(name);
         }
         connectorCache = { at: Date.now(), connected, missing, key };
+        // Every connected account connector (names only), for the shared-skill readiness check.
+        const all = result.out.split("\n")
+          .filter((l) => connectedInLine(l))
+          .map((l) => /^claude\.ai (.+?):/.exec(l.trim())?.[1]?.trim() ?? "")
+          .filter(Boolean);
+        if (result.code === 0) void writeConnectorStatus(all);
       })
       .finally(() => {
         connectorRun = null;
@@ -179,6 +185,20 @@ async function connectors(folder: string, intake: string, refresh: boolean) {
   return { at: 0, connected: [] as string[], missing: [] as string[], key, wanted, checking: true };
 }
 let connectorRun: Promise<void> | null = null;
+
+async function writeConnectorStatus(connected: string[]) {
+  try {
+    const file = path.join(stateDir(), "connector-status.json");
+    const tmp = `${file}.${process.pid}.tmp`;
+    await mkdir(stateDir(), { recursive: true });
+    // Tied to the signed-in account, so another account's result is never read as this one's.
+    const account = await signedInEmail();
+    await writeFile(tmp, `${JSON.stringify({ checkedAt: new Date().toISOString(), account, connected }, null, 2)}\n`);
+    await rename(tmp, file);
+  } catch {
+    // Readiness checks then say "not checked yet"; nothing else depends on this file.
+  }
+}
 
 async function keyIsSet(folder: string, key: string) {
   const text = await readIfThere(path.join(folder, ".env"));
