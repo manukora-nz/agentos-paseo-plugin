@@ -294,6 +294,7 @@ async function agentosBehind(folder: string) {
 }
 
 const SERVICE_URL = process.env.AGENTOS_SERVICE_URL || "https://agentos.manukora.com";
+const WHERE_TO_START_GUIDE = "https://app.notion.com/p/41a188a620a381aa9e72ea1bf1122927";
 
 const KEY_LABELS: Record<string, string> = {
   TRANSCRIPTION_API_KEY: "transcription",
@@ -795,6 +796,20 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
         ],
   });
 
+  // A short guide on organising work in Paseo (workspaces, tabs, 10 rules of thumb from Mike Bell).
+  // Optional reading, so it is always "done": it never counts as a step left and never reopens a
+  // finished setup. The button just opens the guide, any number of times.
+  add({
+    id: "where-to-start",
+    group: "Finish",
+    title: "Where to start in Paseo",
+    detail: "Optional: a two-minute guide to organising your work, when to start a new workspace, when a tab is enough, and 10 rules of thumb.",
+    status: "done",
+    actionLabel: "Open the guide",
+    link: WHERE_TO_START_GUIDE,
+    repeatable: true,
+  });
+
   const auditStarted = state.confirmed.includes("audit");
   add({
     id: "audit",
@@ -1128,6 +1143,8 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
     case "theme":
       await confirm("theme");
       return { message: "Thanks." };
+    case "where-to-start":
+      return { message: "Opening the guide in your browser." };
     case "audit": {
       const launched = await startAgent("/audit", "First audit");
       await confirm("audit");
