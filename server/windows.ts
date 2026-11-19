@@ -151,6 +151,7 @@ export const WINGET_IDS: Record<string, string> = {
   node: "OpenJS.NodeJS.LTS",
   powershell: "Microsoft.PowerShell",
   python: "Python.Python.3.12",
+  ffmpeg: "Gyan.FFmpeg",
 };
 
 export function wingetArgs(tool: string) {

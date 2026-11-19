@@ -136,10 +136,49 @@ export function connectedInLine(line: string) {
   return /\bconnected\b/i.test(line);
 }
 
-function pluginState(list: string, id: string): "running" | "failed" | "absent" {
-  const line = list.split("\n").find((l) => l.trim().split(/\s+/)[0] === id);
-  if (!line) return "absent";
-  return /\bfailed\b/i.test(line) ? "failed" : "running";
+// "claude.ai Cin7: https://... - ✔ Connected" -> "Cin7". Empty for anything that is not an account connector.
+export function connectorName(line: string) {
+  return /^claude\.ai (.+?):\s/.exec(line.trim())?.[1]?.trim() ?? "";
+}
+
+// The same connector: the exact name, or the name with a qualifier in brackets ("Gmail (Manukora)").
+export function connectorNameMatches(actual: string, wanted: string) {
+  const a = actual.toLowerCase();
+  const w = wanted.toLowerCase();
+  return a === w || a.startsWith(`${w} (`);
+}
+
+type PaseoPluginInventory = Map<string, { enabled: boolean; status: string }>;
+
+// The installed Paseo plugins, or null when Paseo could not be asked. A failed or timed-out list
+// must never read as "nothing installed": that would start installs during a status read.
+export function parsePaseoPlugins(result: { code: number; out: string }): PaseoPluginInventory | null {
+  if (result.code !== 0) return null;
+  const start = result.out.indexOf("[");
+  if (start < 0) return null;
+  try {
+    const list = JSON.parse(result.out.slice(start)) as unknown;
+    if (!Array.isArray(list)) return null;
+    const inventory: PaseoPluginInventory = new Map();
+    for (const item of list as Array<{ id?: unknown; enabled?: unknown; status?: unknown }>) {
+      if (typeof item?.id !== "string") return null;
+      inventory.set(item.id, { enabled: item.enabled !== false, status: String(item.status ?? "") });
+    }
+    return inventory;
+  } catch {
+    return null;
+  }
+}
+
+async function paseoPluginInventory() {
+  return parsePaseoPlugins(await run(paseoCli(), ["plugin", "ls", "--json"], { timeoutMs: 30000 }));
+}
+
+export function pluginState(inventory: PaseoPluginInventory, id: string): "running" | "disabled" | "failed" | "absent" {
+  const plugin = inventory.get(id);
+  if (!plugin) return "absent";
+  if (!plugin.enabled || plugin.status === "disabled") return "disabled";
+  return plugin.status === "running" ? "running" : "failed";
 }
 
 async function connectors(folder: string, intake: string, refresh: boolean) {
@@ -162,15 +201,17 @@ async function connectors(folder: string, intake: string, refresh: boolean) {
         const connected: string[] = [];
         const missing: string[] = [];
         for (const name of wanted) {
-          const line = result.out.split("\n").find((l) => new RegExp(`claude\\.ai .*${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i").test(l));
-          if (line && connectedInLine(line)) connected.push(name);
+          // Exact connector name, so an organisation connector whose name merely contains "Cin7" can no
+          // longer stand in for Cin7. Any matching line that is connected counts.
+          const lines = result.out.split("\n").filter((l) => connectorNameMatches(connectorName(l), name));
+          if (lines.some((l) => connectedInLine(l))) connected.push(name);
           else missing.push(name);
         }
         connectorCache = { at: Date.now(), connected, missing, key };
         // Every connected account connector (names only), for the shared-skill readiness check.
         const all = result.out.split("\n")
           .filter((l) => connectedInLine(l))
-          .map((l) => /^claude\.ai (.+?):/.exec(l.trim())?.[1]?.trim() ?? "")
+          .map(connectorName)
           .filter(Boolean);
         if (result.code === 0) void writeConnectorStatus(all);
       })
@@ -322,6 +363,80 @@ function suggestedTuneUp(seed: string) {
   let h = 0;
   for (const c of seed) h = (h * 31 + c.charCodeAt(0)) >>> 0;
   return `${5 + (h % 50)} ${9 + ((h >> 8) % 2)} * * 1`;
+}
+
+// The setup screen asks for a day and a clock time, never cron. These turn the saved cron into
+// what a person reads ("Monday", "9:24 AM") and back.
+const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const DAY_WORDS: Record<string, string> = { "every day": "*", daily: "*", everyday: "*", weekdays: "1-5" };
+const own = (record: Record<string, string>, key: string) => (Object.hasOwn(record, key) ? record[key] : undefined);
+
+export function cronToDayTime(cron: string): { day: string; time: string } | undefined {
+  const parts = cron.trim().split(/\s+/);
+  if (parts.length !== 5) return undefined;
+  const [minute, hour, dayOfMonth, month, dayOfWeek] = parts;
+  if (!/^\d{1,2}$/.test(minute) || !/^\d{1,2}$/.test(hour) || dayOfMonth !== "*" || month !== "*") return undefined;
+  const h = Number(hour);
+  const m = Number(minute);
+  if (h > 23 || m > 59) return undefined;
+  let day: string;
+  if (dayOfWeek === "*") day = "Every day";
+  else if (dayOfWeek === "1-5") day = "Weekdays";
+  // One day or a list of days ("1,3" is "Monday, Wednesday"), so a custom choice is shown as set.
+  else if (/^[0-7](,[0-7])*$/.test(dayOfWeek)) day = [...new Set(dayOfWeek.split(",").map((d) => Number(d) % 7))].map((d) => WEEKDAYS[d]).join(", ");
+  else return undefined;
+  const time = `${h % 12 === 0 ? 12 : h % 12}:${String(m).padStart(2, "0")} ${h < 12 ? "AM" : "PM"}`;
+  return { day, time };
+}
+
+export function dayTimeToCron(dayText: string, timeText: string): string {
+  const dayKey = dayText.trim().toLowerCase().replace(/\s+/g, " ");
+  // Own keys only: "constructor" or "toString" must not read as a day.
+  let dayOfWeek = own(DAY_WORDS, dayKey);
+  if (!dayOfWeek) {
+    // Day names or any start of one with at least three letters, one or several:
+    // "Mon", "Tues", "Thursday", "Mon, Wed", "Tuesday and Friday".
+    const indexes = dayKey.split(/\s*(?:,|&|\band\b)\s*/).filter(Boolean).map((word) =>
+      word.length >= 3 ? WEEKDAYS.findIndex((d) => d.toLowerCase().startsWith(word)) : -1,
+    );
+    if (!indexes.length || indexes.some((i) => i < 0)) throw new Error("Enter a day like Monday, Mon and Thu, Weekdays or Every day.");
+    dayOfWeek = [...new Set(indexes)].sort((a, b) => a - b).join(",");
+  }
+  const t = /^(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?$/i.exec(timeText.trim().replace(/\s+/g, " "));
+  if (!t) throw new Error("Enter a time like 9:30 AM or 14:30.");
+  let hour = Number(t[1]);
+  const minute = Number(t[2] ?? "0");
+  const meridiem = t[3]?.toLowerCase().replace(/\./g, "");
+  if (meridiem) {
+    if (hour < 1 || hour > 12) throw new Error("Enter a time like 9:30 AM or 14:30.");
+    hour = (hour % 12) + (meridiem === "pm" ? 12 : 0);
+  }
+  if (hour > 23 || minute > 59) throw new Error("Enter a time like 9:30 AM or 14:30.");
+  return `${minute} ${hour} * * ${dayOfWeek}`;
+}
+
+const TUNE_UP_NAME = "AgentOS tune-up";
+
+// The live tune-up schedule, null when there is none, or undefined when Paseo could not be asked
+// (a failed list must never lead to a second schedule).
+export function findTuneUp(result: { code: number; out: string }): { id: string; cron: string; timezone: string } | null | undefined {
+  if (result.code !== 0) return undefined;
+  const start = result.out.indexOf("[");
+  if (start < 0) return undefined;
+  try {
+    const list = JSON.parse(result.out.slice(start)) as Array<{ id?: string; name?: string; cadence?: string; status?: string }>;
+    if (!Array.isArray(list)) return undefined;
+    const found = list.find((item) => item?.name === TUNE_UP_NAME && item.status !== "completed");
+    if (!found?.id) return null;
+    const cadence = /^cron:(.+?)\s*(?:\(([^)]+)\))?\s*$/.exec(found.cadence ?? "");
+    return { id: found.id, cron: cadence?.[1]?.trim() ?? "", timezone: cadence?.[2]?.trim() ?? "" };
+  } catch {
+    return undefined;
+  }
+}
+
+async function liveTuneUp() {
+  return findTuneUp(await run(paseoCli(), ["schedule", "ls", "--json"], { timeoutMs: 30000 }));
 }
 
 async function mtimeOf(file: string) {
@@ -568,25 +683,37 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
     skippable: true,
   });
 
+  // The AgentOS Paseo plugins (Usage remaining, Awaiting you, Skills library, Keep awake) are for
+  // everyone, so they do not wait for onboarding and are installed automatically as soon as the
+  // folder is current. Claude plugins depend on the role, so they still wait for onboarding.
   const claudeList = claudeInstalled && scaffolded ? (await run("claude", ["plugin", "list"], { timeoutMs: 30000 })).out : "";
-  const paseoList = paseoPlugins.length && scaffolded ? (await run(paseoCli(), ["plugin", "ls"], { timeoutMs: 30000 })).out : "";
-  const wanted = claudePlugins.filter((p) => p.when !== "n8n" || wantsN8n(intake));
+  const paseoReady = paseoPlugins.length > 0 && folderReady && !behind;
+  const inventory = paseoReady ? await paseoPluginInventory() : null;
+  const wanted = scaffolded ? claudePlugins.filter((p) => p.when !== "n8n" || wantsN8n(intake)) : [];
+  const absentPaseo = inventory ? paseoPlugins.filter((p) => pluginState(inventory, p.id) !== "running") : [];
   const absent = [
     ...wanted.filter((p) => !claudeList.includes(p.id)).map((p) => p.title),
-    ...paseoPlugins.filter((p) => pluginState(paseoList, p.id) !== "running").map((p) => p.title),
+    ...absentPaseo.map((p) => p.title),
   ];
+  // The Paseo plugins install on their own, once per Paseo session, and only from a successful
+  // inventory (a failed or slow "paseo plugin ls" must not look like "nothing installed"). Claude
+  // role plugins stay on the button: they need onboarding's choices. A failure shows on the step
+  // and the button retries; it never loops.
+  if (absentPaseo.length && !jobs.has("plugins")) startJob("plugins", () => installPlugins(folder, false));
   add({
     id: "plugins",
     group: "Your interface",
-    title: "Add your other plugins",
-    detail: !scaffolded
-      ? "Decided by your answers in onboarding."
-      : absent.length
-        ? `To add: ${absent.join(", ")}.`
-        : wanted.length || paseoPlugins.length
+    title: "Add the AgentOS plugins",
+    detail: !folderReady || behind
+      ? "Added automatically once AgentOS is up to date."
+      : paseoReady && !inventory
+        ? "Could not check your Paseo plugins just now. Press Add them to try again."
+        : absent.length
+        ? `Required. Adding: ${absent.join(", ")}. Then quit and reopen Paseo.`
+        : scaffolded
           ? "All added."
-          : "Nothing extra needed for your role.",
-    status: !scaffolded ? "waiting" : absent.length ? "todo" : "done",
+          : "AgentOS plugins added. Role plugins are added after onboarding.",
+    status: !folderReady || behind ? "waiting" : absent.length || (paseoReady && !inventory) ? "todo" : "done",
     actionLabel: "Add them",
   });
 
@@ -688,8 +815,9 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
           : "Turns on once the shared keys are in."
       : ffmpegOk
         ? "Set up. Your first real voice memo or Loom is the test."
-        : "Loom screenshots need ffmpeg, which is not installed. Voice memos do not need it. Ask AI & Systems if you use Looms.",
+        : "Loom screenshots need ffmpeg. Voice memos do not. Press Install ffmpeg (no Terminal, no Homebrew; a few minutes), or skip it if you do not use Looms.",
     status: keysSkipped && !keysIn ? "skipped" : keysIn ? (ffmpegOk ? "done" : "needs-you") : "waiting",
+    actionLabel: keysIn && !ffmpegOk ? "Install ffmpeg" : undefined,
     skippable: keysIn && !ffmpegOk,
   });
 
@@ -764,7 +892,8 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
     actionLabel: "Run it",
   });
   const tuneUp = /^Tune-up:\s*(.+?)\s*$/im.exec(await readIfThere(path.join(folder, "context/about-me.md")))?.[1] ?? "";
-  const scheduled = live ? /"AgentOS tune-up"|AgentOS tune-up/.test((await run(paseoCli(), ["schedule", "ls", "--json"], { timeoutMs: 30000 })).out) : false;
+  const liveSchedule = live ? await liveTuneUp() : null;
+  const scheduled = Boolean(liveSchedule);
   // A sleeping computer misses its tune-up, so show it as overdue after eight days.
   const lastTuneUp = scheduled ? await mtimeOf(path.join(folder, "data/tune-up/latest.md")) : 0;
   if (scheduled && !state.tuneUpScheduledAt) {
@@ -774,6 +903,21 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
     });
   }
   const since = Math.max(lastTuneUp, state.tuneUpScheduledAt ?? Date.now(), state.tuneUpRunAt ?? 0);
+  // The live schedule wins, then the one saved at onboarding, then a suggestion. A custom cron that
+  // cannot be shown as a day and a time is kept and shown as it is, never replaced by the suggestion.
+  const savedCron = liveSchedule?.cron || tuneUp.split(/\s+/).slice(0, 5).join(" ");
+  const savedZone = liveSchedule?.timezone || tuneUp.split(/\s+/)[5] || Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const customCron = /^(\S+\s+){4}\S+$/.test(savedCron) && !cronToDayTime(savedCron) ? savedCron : "";
+  const tuneUpWhen = cronToDayTime(savedCron) ?? cronToDayTime(suggestedTuneUp(folder)) ?? { day: "Monday", time: "9:30 AM" };
+  const whenInputs = [
+    ...(customCron
+      ? [{ key: "cron", label: "Schedule (your own, in cron form)", secret: false, value: customCron }]
+      : [
+          { key: "day", label: "Day (Monday, Mon and Thu, Weekdays or Every day)", secret: false, value: tuneUpWhen.day },
+          { key: "time", label: "Time (for example 9:30 AM)", secret: false, value: tuneUpWhen.time },
+        ]),
+    { key: "timezone", label: "Time zone", secret: false, value: savedZone },
+  ];
   const overdue = scheduled && Date.now() - since > 8 * 24 * 3600 * 1000;
   add({
     id: "tune-up",
@@ -782,18 +926,13 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
     detail: overdue
       ? "Your tune-up has not run for over a week, probably because the computer was asleep. Run it now?"
       : scheduled
-        ? "Your regular tune-up is scheduled. Leave your computer on at that time."
+        ? `Your tune-up runs ${customCron ? `on your own schedule (${customCron})` : `${tuneUpWhen.day === "Every day" || tuneUpWhen.day === "Weekdays" ? tuneUpWhen.day.toLowerCase() : `every ${tuneUpWhen.day}`} at ${tuneUpWhen.time}`}. Leave your computer on at that time. To change it, edit below and press Change it.`
         : "Keeps AgentOS fast and tidy, and updates it, its connections and Claude Code. Your computer needs to be on at the time you choose.",
     status: overdue ? "needs-you" : scheduled ? "done" : live ? "todo" : "waiting",
-    actionLabel: overdue ? "Run it now" : "Schedule it",
+    actionLabel: overdue ? "Run it now" : scheduled ? "Change it" : "Schedule it",
     skippable: true,
-    repeatable: overdue,
-    inputs: scheduled
-      ? []
-      : [
-          { key: "cron", label: "When (cron; the suggestion is a Monday morning)", secret: false, value: tuneUp.split(/\s+/).slice(0, 5).join(" ") || suggestedTuneUp(folder) },
-          { key: "timezone", label: "Time zone", secret: false, value: tuneUp.split(/\s+/)[5] || Intl.DateTimeFormat().resolvedOptions().timeZone },
-        ],
+    repeatable: overdue || scheduled,
+    inputs: overdue ? [] : whenInputs,
   });
 
   // A short guide on organising work in Paseo (workspaces, tabs, 10 rules of thumb from Mike Bell).
@@ -822,16 +961,53 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
     repeatable: auditStarted,
   });
 
+  // Hand-offs: say where a step is running until it is verified done, then forget it.
+  const handoffs = state.handoffs ?? {};
+  const finished = steps.filter((step) => handoffs[step.id] && step.status === "done").map((step) => step.id);
+  // Signed in to Claude in a terminal, but Paseo may still show Claude as Unavailable until it
+  // re-reads the sign-in. Ask Paseo once; if so, show the restart banner.
+  let restartForClaude = false;
+  if (finished.includes("claude-signin")) {
+    const providers = await run(paseoCli(), ["provider", "ls", "--json"], { timeoutMs: 15000 });
+    restartForClaude = providers.code === 0 && claudeProviderUnavailable(providers.out);
+  }
+  if (finished.length || restartForClaude) {
+    await updateState((s) => {
+      for (const id of finished) delete s.handoffs?.[id];
+      if (restartForClaude) s.restartDaemon = process.ppid;
+    });
+  }
+  let watching = false;
+  const shown = steps.map((step) => {
+    const handoff = handoffs[step.id];
+    if (!handoff || step.status === "done" || step.status === "working" || Date.now() - handoff.at > HANDOFF_FRESH_MS) return step;
+    watching = true;
+    const where = handoff.kind === "chat" ? `the "${handoff.name}" chat` : `the "${handoff.name}" terminal tab`;
+    return { ...step, detail: `Running in ${where}. Finish there; this step updates on its own when it is done. ${step.detail}` };
+  });
   return {
-    steps: steps.map((step) =>
+    steps: shown.map((step) =>
       state.skipped.includes(step.id) && step.status !== "done" && step.skippable
         ? { ...step, status: "skipped" as const }
         : step,
     ),
     folder,
     workspaceId: state.workspaceId,
-    restartNeeded: Boolean(state.restartDaemon && state.restartDaemon === process.ppid),
+    restartNeeded: restartForClaude || Boolean(state.restartDaemon && state.restartDaemon === process.ppid),
+    watching,
   };
+}
+
+const HANDOFF_FRESH_MS = 45 * 60 * 1000;
+
+export function claudeProviderUnavailable(out: string) {
+  try {
+    const list = JSON.parse(out.slice(Math.max(0, out.indexOf("[")))) as Array<{ provider?: string; status?: string }>;
+    const claude = Array.isArray(list) ? list.find((p) => p?.provider === "claude") : undefined;
+    return Boolean(claude && claude.status !== "available");
+  } catch {
+    return false;
+  }
 }
 
 async function roleServerPicks(folder: string, intake: string) {
@@ -862,6 +1038,46 @@ function quoteForShell(value: string) {
 function assertRan(result: { code: number; out: string }, what: string) {
   if (result.code !== 0) throw new Error(`${what} did not finish: ${lastLines(result.out)}`);
   return result.out;
+}
+
+// Installs the AgentOS Paseo plugins from the person's own folder (kept current by the update step),
+// and, once onboarding has chosen them, the role's Claude plugins.
+async function installPlugins(folder: string, includeClaude: boolean) {
+  const intake = await readIfThere(path.join(folder, "aios-intake.md"));
+  if (includeClaude) {
+    for (const plugin of claudePlugins) {
+      if (plugin.when === "n8n" && !wantsN8n(intake)) continue;
+      await run("claude", ["plugin", "marketplace", "add", plugin.marketplace], { timeoutMs: 120000 });
+      assertRan(await run("claude", ["plugin", "install", plugin.install], { timeoutMs: 180000 }), `Adding ${plugin.title}`);
+    }
+  }
+  const installed = await paseoPluginInventory();
+  if (!installed) throw new Error("Could not list your Paseo plugins. Check Paseo is open, then press Add them again.");
+  let changed = false;
+  // Paseo loads a new or re-enabled plugin only after a full restart, so keep the restart banner up
+  // until then (an automatic install otherwise finished with the step "done" and no instruction).
+  const needsRestart = () =>
+    updateState((state) => {
+      state.restartDaemon = process.ppid;
+    });
+  for (const plugin of paseoPlugins) {
+    const state = pluginState(installed, plugin.id);
+    if (state === "running") continue;
+    if (state === "disabled") {
+      assertRan(await run(paseoCli(), ["plugin", "enable", plugin.id], { timeoutMs: 60000 }), `Turning on ${plugin.title}`);
+      changed = true;
+      await needsRestart();
+      continue;
+    }
+    // A broken copy with the same id (left by the desktop pilot) is replaced.
+    if (state === "failed") await run(paseoCli(), ["plugin", "remove", plugin.id], { timeoutMs: 60000 });
+    const source = path.join(folder, plugin.source);
+    if (!(await exists(path.join(source, "paseo-plugin.json")))) throw new Error(`${plugin.title} is not in your AgentOS folder yet. Run "Bring AgentOS up to date" first.`);
+    assertRan(await run(paseoCli(), ["plugin", "install", source], { timeoutMs: 180000 }), `Adding ${plugin.title}`);
+    changed = true;
+    await needsRestart();
+  }
+  return changed ? "Quit and reopen Paseo to see them." : "";
 }
 
 async function regenerateCodex(folder: string) {
@@ -1033,10 +1249,15 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
       throw new Error("Sign in to your Manukora Claude account first.");
     }
   };
+  const handedOff = (kind: "chat" | "terminal", name: string) =>
+    updateState((state) => {
+      state.handoffs = { ...(state.handoffs ?? {}), [stepId]: { kind, name, at: Date.now() } };
+    });
   const startAgent = async (prompt: string, title: string) => {
     await requireAccount();
     const workspace = await openWorkspace();
     const agent = await workspace.agents.create({ config: CLAUDE_AGENT, title, prompt });
+    await handedOff("chat", title);
     return { workspaceId: workspace.id, agentId: agent.id };
   };
   const openTerminal = async (name: string, command: string, args: string[] = []) => {
@@ -1054,14 +1275,16 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
       const target = resolveWindowsCommand(command, searchPath) ?? command;
       const line = `${refresh}; & ${[target, ...args].map(quoteForPowerShell).join(" ")}`;
       await workspace.terminals.create({ name, command: shell, args: ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NoExit", "-Command", line] });
-      return { message: `Opened ${name}. Look for the new terminal tab at the top of the window.`, workspaceId: workspace.id };
+      await handedOff("terminal", name);
+      return { message: `Opened ${name}. Look for the new terminal tab at the top of the window; this step updates on its own when you finish there.`, workspaceId: workspace.id };
     }
     const resolved = (await run("/usr/bin/which", [command], { timeoutMs: 10000 })).out.split("\n")[0]?.trim();
     const shell = process.env.SHELL || "/bin/zsh";
     const target = [resolved?.startsWith("/") ? resolved : command, ...args].map(quoteForShell).join(" ");
     // A login shell gives the terminal the same tools the person has in Terminal.
     await workspace.terminals.create({ name, command: shell, args: ["-lc", `exec ${target}`] });
-    return { message: `Opened ${name}. Look for the new terminal tab at the top of the window.`, workspaceId: workspace.id };
+    await handedOff("terminal", name);
+    return { message: `Opened ${name}. Look for the new terminal tab at the top of the window; this step updates on its own when you finish there.`, workspaceId: workspace.id };
   };
   const markRestart = () =>
     updateState((state) => {
@@ -1096,6 +1319,22 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
         await markRestart();
       });
       return { message: "Installing. This can take a few minutes." };
+    }
+    case "voice": {
+      // ffmpeg for Looms, without Homebrew: a pinned, checksummed build on Mac, winget on Windows.
+      startJob("voice", async () => {
+        if (isWindows) await installWindowsTools(run, ["ffmpeg"]);
+        else {
+          const root = await repoRoot();
+          assertRan(
+            await run("sh", ["scripts/setup/install-tools.sh", "--manifest", "docs/setup/tools-manifest.json", "--ffmpeg"], { cwd: root, timeoutMs: 900000 }),
+            "Installing ffmpeg",
+          );
+        }
+        // Chats started before the install do not see the new command until Paseo restarts.
+        await markRestart();
+      });
+      return { message: "Installing ffmpeg. This takes a few minutes." };
     }
     case "claude-install": {
       startJob("claude-install", async () => {
@@ -1135,7 +1374,8 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
         `and follow what it prints:\n\npwsh -NoProfile -File ${JSON.stringify(script)} -NodePath .${releaseSource}\n\n` +
         "Use this command even if this folder's own /update skill says the folder cannot be updated: that skill may be " +
         "from an older AgentOS. If the script reports conflicts with my own changes, explain them in plain words and ask " +
-        "me before changing anything. When it succeeds, tell me to restart Paseo.";
+        "me before changing anything. If it prints UP TO DATE, tell me AgentOS is current: that is success, not a block, and " +
+        "GitHub access is never needed. When it updates, tell me to restart Paseo.";
       return { message: "Updating your AgentOS.", ...(await startAgent(prompt, "Update AgentOS")) };
     }
     case "claude-signin":
@@ -1152,25 +1392,9 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
     }
     case "plugins": {
       const folder = await currentFolder();
-      startJob("plugins", async () => {
-        const intake = await readIfThere(path.join(folder, "aios-intake.md"));
-        for (const plugin of claudePlugins) {
-          if (plugin.when === "n8n" && !wantsN8n(intake)) continue;
-          await run("claude", ["plugin", "marketplace", "add", plugin.marketplace], { timeoutMs: 120000 });
-          assertRan(await run("claude", ["plugin", "install", plugin.install], { timeoutMs: 180000 }), `Adding ${plugin.title}`);
-        }
-        // Installed from the person's own AgentOS folder, which the update step keeps current.
-        const installed = (await run(paseoCli(), ["plugin", "ls"], { timeoutMs: 30000 })).out;
-        for (const plugin of paseoPlugins) {
-          const state = pluginState(installed, plugin.id);
-          if (state === "running") continue;
-          // A broken copy with the same id (left by the desktop pilot) is replaced.
-          if (state === "failed") await run(paseoCli(), ["plugin", "remove", plugin.id], { timeoutMs: 60000 });
-          const source = path.join(folder, plugin.source);
-          if (!(await exists(path.join(source, "paseo-plugin.json")))) throw new Error(`${plugin.title} is not in your AgentOS folder yet. Run "Bring AgentOS up to date" first.`);
-          assertRan(await run(paseoCli(), ["plugin", "install", source], { timeoutMs: 180000 }), `Adding ${plugin.title}`);
-        }
-      });
+      const intake = await readIfThere(path.join(folder, "aios-intake.md"));
+      if (!jobs.get("plugins")?.running) jobs.delete("plugins");
+      startJob("plugins", () => installPlugins(folder, intakePhaseDone(intake, "A")));
       return { message: "Adding your plugins." };
     }
     case "onboard": {
@@ -1296,7 +1520,8 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
         });
         return { message: "Running your tune-up now.", ...started };
       }
-      const cron = (values.cron ?? "").trim();
+      // Older setup screens sent a cron field; current ones send a day and a time.
+      const cron = values.cron !== undefined ? values.cron.trim() : dayTimeToCron(values.day ?? "", values.time ?? "");
       const timezone = (values.timezone ?? "").trim();
       if (!/^(\S+\s+){4}\S+$/.test(cron)) throw new Error("That schedule does not look right. Use five parts, like 0 9 * * 1.");
       const [, , dayOfMonth, , dayOfWeek] = cron.split(/\s+/);
@@ -1305,8 +1530,18 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
       }
       if (!/^[A-Za-z_]+(\/[A-Za-z_+-]+)*$/.test(timezone)) throw new Error("Enter a time zone like Pacific/Auckland or America/Los_Angeles.");
       const folder = await currentFolder();
+      // Change the existing tune-up in place; never add a second one beside it.
+      const existing = await liveTuneUp();
+      if (existing === undefined) throw new Error("Could not check your schedules just now. Try again in a moment.");
+      if (existing) {
+        assertRan(
+          await run(paseoCli(), ["schedule", "update", existing.id, "--cron", cron, "--timezone", timezone], { timeoutMs: 60000 }),
+          "Changing the tune-up",
+        );
+        return { message: "Your tune-up time is changed." };
+      }
       assertRan(
-        await run(paseoCli(), ["schedule", "create", "--name", "AgentOS tune-up", "--cron", cron, "--timezone", timezone,
+        await run(paseoCli(), ["schedule", "create", "--name", TUNE_UP_NAME, "--cron", cron, "--timezone", timezone,
           "--provider", CLAUDE_AGENT.provider, "--mode", CLAUDE_AGENT.modeId, "--cwd", folder, "/os-tune-up unattended"], { timeoutMs: 60000 }),
         "Scheduling the tune-up",
       );

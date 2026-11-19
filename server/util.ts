@@ -30,6 +30,9 @@ export interface State {
   tuneUpScheduledAt?: number;
   // When the person last pressed "Run it now", so a running tune-up is not shown as overdue.
   tuneUpRunAt?: number;
+  // The chat or terminal a step handed its work to, so the setup page can say where it is running
+  // until the step is verified done (or the hand-off is old enough to be stale).
+  handoffs?: Record<string, { kind: "chat" | "terminal"; name: string; at: number }>;
 }
 
 export async function exists(target: string) {

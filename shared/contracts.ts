@@ -27,6 +27,8 @@ export const StatusResult = z.object({
   folder: z.string(),
   workspaceId: z.string().optional(),
   restartNeeded: z.boolean(),
+  // True while a step is running in a chat or terminal, so the page checks more often.
+  watching: z.boolean().optional(),
 });
 export type StatusResult = z.infer<typeof StatusResult>;
 

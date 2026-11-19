@@ -76,6 +76,13 @@ export function SetupScreen({ theme, layout, navigation }: PluginScreenProps) {
 
   // The first check can outlast Paseo's call limit; the server then answers "still checking".
   const stillChecking = data?.steps.some((s) => s.id === "still-checking") ?? false;
+  // While a step runs in a chat or terminal, check every 10 seconds so it clears soon after it finishes.
+  const watching = data?.watching ?? false;
+  useEffect(() => {
+    if (!watching) return;
+    const timer = setInterval(() => void refresh(), 10000);
+    return () => clearInterval(timer);
+  }, [watching, refresh]);
   useEffect(() => {
     if (!stillChecking) return;
     const soon = setTimeout(() => void refresh(), 5000);
