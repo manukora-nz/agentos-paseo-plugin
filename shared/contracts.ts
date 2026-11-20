@@ -27,6 +27,13 @@ export const StatusResult = z.object({
   folder: z.string(),
   workspaceId: z.string().optional(),
   restartNeeded: z.boolean(),
+  // What is waiting on the restart, by name; whether to restart now (later steps need it) or once the
+  // other steps are done; and what the last restart picked up (shown for a few minutes afterwards).
+  restartFor: z.array(z.string()).optional(),
+  restartNow: z.boolean().optional(),
+  restartPickedUp: z.array(z.string()).optional(),
+  // Finished steps whose change takes effect only after the restart (shown as "Waiting for restart").
+  restartSteps: z.array(z.string()).optional(),
   // True while a step is running in a chat or terminal, so the page checks more often.
   watching: z.boolean().optional(),
 });
@@ -74,4 +81,11 @@ export const applyUpdates = defineRpc({
   name: "setup.updates.apply",
   input: z.object({}),
   output: z.object({ text: z.string() }),
+});
+
+// A light read for the sidebar: is a restart waiting, and for what. No checks run.
+export const getRestart = defineRpc({
+  name: "setup.restart",
+  input: z.object({}).default({}),
+  output: z.object({ needed: z.boolean(), names: z.array(z.string()), now: z.boolean() }),
 });

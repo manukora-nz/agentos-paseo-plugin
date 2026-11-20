@@ -11,6 +11,7 @@ import {
   type StatusResult,
   type Step,
 } from "../shared/contracts";
+import { pickedUpNotice, restartBanner } from "./restart-copy";
 
 const marks: Record<Step["status"], string> = {
   done: "Done",
@@ -163,6 +164,8 @@ export function SetupScreen({ theme, layout, navigation }: PluginScreenProps) {
     return [...map.entries()];
   }, [data]);
   const remaining = data?.steps.filter((s) => s.status !== "done" && s.status !== "skipped").length ?? 0;
+  const waitsForRestart = (step: Step) => step.status === "done" && !!data?.restartSteps?.includes(step.id);
+  const restartOnly = !!data && !remaining && data.restartNeeded;
 
   return (
     <ScrollView style={styles.root} contentContainerStyle={styles.body}>
@@ -172,7 +175,9 @@ export function SetupScreen({ theme, layout, navigation }: PluginScreenProps) {
           ? "Checking your computer..."
           : remaining
             ? `${remaining} ${remaining === 1 ? "step" : "steps"} left. Work down the list. You can come back any time.`
-            : "All done. AgentOS is ready."}
+            : restartOnly
+              ? "Almost done: restart Paseo once to finish."
+              : "All done. AgentOS is ready."}
       </Text>
       <View style={styles.actions}>
         <Pressable accessibilityRole="button" style={styles.quiet} onPress={() => void refresh(true)}>
@@ -182,9 +187,11 @@ export function SetupScreen({ theme, layout, navigation }: PluginScreenProps) {
       {data?.restartNeeded ? (
         <View style={styles.banner}>
           <Text style={styles.bannerText}>
-            {(typeof navigator !== "undefined" && /Win/i.test(navigator.platform || navigator.userAgent || "")) ? "Fully quit Paseo (right-click its icon in the taskbar tray and choose Quit) and open it again so these changes take effect. Your progress is saved." : "Fully quit Paseo with Command-Q and open it again so these changes take effect. Your progress is saved."}
+            {restartBanner(data.restartFor, data.restartNow)}
           </Text>
         </View>
+      ) : data?.restartPickedUp?.length ? (
+        <Text style={styles.text}>{pickedUpNotice(data.restartPickedUp)}</Text>
       ) : null}
       {notice ? <Text style={styles.text}>{notice}</Text> : null}
       {error ? <Text style={styles.muted}>{error}</Text> : null}
@@ -195,10 +202,10 @@ export function SetupScreen({ theme, layout, navigation }: PluginScreenProps) {
             <View key={step.id} style={styles.card}>
               <View style={styles.row}>
                 <Text style={styles.text}>{step.title}</Text>
-                <Text style={styles.muted}>{marks[step.status]}</Text>
+                <Text style={styles.muted}>{waitsForRestart(step) ? "Waiting for restart" : marks[step.status]}</Text>
               </View>
               <Text selectable style={styles.muted}>
-                {step.detail}
+                {waitsForRestart(step) ? `Takes effect after you restart Paseo. ${step.detail}` : step.detail}
               </Text>
               {actionable.includes(step.status) || step.repeatable
                 ? step.inputs.map((input) => (

@@ -26,6 +26,10 @@ export interface State {
   keysOutstanding?: string;
   // The Paseo process that was running when a change needed a restart.
   restartDaemon?: number;
+  // The steps whose change takes effect only after that restart (shown by name, and as "Waiting for
+  // restart" on their cards), and, once Paseo has restarted, what it picked up (shown for a while).
+  restartFor?: string[];
+  restartPickedUp?: { steps: string[]; at: number };
   // When the weekly tune-up was scheduled, so a missed first run shows as overdue.
   tuneUpScheduledAt?: number;
   // When the person last pressed "Run it now", so a running tune-up is not shown as overdue.

@@ -6,6 +6,7 @@ import { bundleFile, exists, serviceFile } from "./server/util";
 import {
   applyUpdates,
   checkUpdates,
+  getRestart,
   getStatus,
   runStep,
   sendReport,
@@ -13,6 +14,7 @@ import {
 } from "./shared/contracts";
 import {
   report,
+  restartView,
   runAction,
   setSkip,
   status,
@@ -23,6 +25,10 @@ import {
 
 export default function contribute(server: PluginServerContext) {
   server.handle(getStatus, ({ refresh }) => status(refresh));
+  server.handle(getRestart, async () => {
+    const view = await restartView();
+    return { needed: view.needed, names: view.names, now: view.now };
+  });
   server.handle(runStep, ({ stepId, values }, { paseo }) =>
     runAction(paseo as unknown as Paseo, stepId, values),
   );

@@ -19,6 +19,7 @@ import {
   testMode,
   toolEnvironment,
   updateState,
+  type State,
 } from "./util";
 import { CLAUDE_INSTALL_ARGS, CLAUDE_WINGET_ARGS, ensureClaudeOnUserPath, installWindowsTools, isWindows, quoteForPowerShell, resolveWindowsCommand, windowsPreflight, wingetSucceeded } from "./windows";
 import { bundleFile, bundledRepo, sourceDir, stateDir } from "./util";
@@ -292,6 +293,75 @@ async function stillChecking(): Promise<StatusResult> {
     restartNeeded: false,
   };
 }
+
+
+// Restart guidance (2.3.1). A change that Paseo picks up only after a full quit records its step here.
+export const RESTART_NAMES: Record<string, string> = {
+  plugins: "the AgentOS plugins",
+  "claude-install": "Claude Code",
+  "claude-signin": "your Claude sign-in",
+  tools: "the new tools",
+  voice: "voice",
+  onboard: "your onboarding",
+  "shared-keys": "your team keys",
+  "slack-drafts": "Slack drafts",
+  "role-tools": "your role tools",
+  codex: "Codex",
+};
+// Later steps depend on these, so the page says "restart now" rather than "at the end".
+const RESTART_NOW = new Set(["claude-install", "claude-signin", "tools"]);
+const PICKED_UP_SHOWN_MS = 10 * 60 * 1000;
+
+export function restartName(id: string) {
+  return RESTART_NAMES[id] ?? "the last change";
+}
+
+export function markRestartFor(state: State, stepId: string) {
+  // A new Paseo process since the last mark means that restart already happened: start a new list.
+  if (state.restartDaemon !== process.ppid) state.restartFor = [];
+  state.restartDaemon = process.ppid;
+  state.restartFor = [...new Set([...(state.restartFor ?? []), stepId])];
+}
+
+// Moves a finished restart's list to "picked up". Works on the state inside the write: a restart marked
+// for this Paseo since the caller looked is left alone.
+export function settleRestart(s: State, now = Date.now()) {
+  if (!s.restartDaemon || s.restartDaemon === process.ppid) return;
+  const done = s.restartFor ?? [];
+  if (done.length) s.restartPickedUp = { steps: done, at: now };
+  delete s.restartDaemon;
+  delete s.restartFor;
+}
+
+export interface RestartView {
+  needed: boolean;
+  steps: string[];
+  names: string[];
+  now: boolean;
+  pickedUp: string[];
+}
+
+// Reads (and, after a restart, settles) the restart record. actionable: steps the person can still work
+// on; with none left, the restart is the last thing to do, so it is "now".
+export async function restartView(actionable?: number): Promise<RestartView> {
+  let state = await loadState();
+  if (state.restartDaemon && state.restartDaemon !== process.ppid) {
+    // Settle from the state inside the write, never from the snapshot above: a step may have marked a
+    // new restart for this Paseo in between, and that one must survive.
+    state = await updateState(settleRestart);
+  }
+  const needed = Boolean(state.restartDaemon && state.restartDaemon === process.ppid);
+  const steps = needed ? state.restartFor ?? [] : [];
+  const picked = state.restartPickedUp && Date.now() - state.restartPickedUp.at < PICKED_UP_SHOWN_MS ? state.restartPickedUp.steps : [];
+  return {
+    needed,
+    steps,
+    names: steps.map(restartName),
+    now: needed && (steps.length === 0 || steps.some((id) => RESTART_NOW.has(id)) || actionable === 0),
+    pickedUp: picked.map(restartName),
+  };
+}
+
 
 export async function status(refresh: boolean, budgetMs = STATUS_BUDGET_MS): Promise<StatusResult> {
   const full = statusNow(refresh).then((value) => (lastShown = value));
@@ -646,7 +716,11 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
   });
 
   const accountAccepted = signedIn && (onTeam || state.skipped.includes("claude-signin"));
-  const canStart = folderReady && accountAccepted;
+  // These steps run in a Claude chat: while Paseo still needs a restart to pick up Claude, wait for it.
+  const claudeRestartPending =
+    state.restartDaemon === process.ppid && (state.restartFor ?? []).some((id) => id === "claude-signin" || id === "claude-install");
+  const canStart = folderReady && accountAccepted && !claudeRestartPending;
+  const afterRestart = claudeRestartPending ? " Restart Paseo first, so it picks up Claude." : "";
   const behind = folderReady && (await agentosBehind(folder));
   add({
     id: "agentos-update",
@@ -655,7 +729,7 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
     detail: !folderReady
       ? "Checked once your folder is ready."
       : behind
-        ? "A newer AgentOS is available from AI & Systems."
+        ? `A newer AgentOS is available from AI & Systems.${afterRestart}`
         : "You have the latest AgentOS.",
     status: !folderReady ? "waiting" : !behind ? "done" : canStart ? "todo" : "waiting",
     actionLabel: "Update",
@@ -668,7 +742,7 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
     title: "Tell AgentOS about you",
     detail: scaffolded
       ? "Your context is written."
-      : "A short interview about your role, priorities and tools. Takes about 15 minutes.",
+      : `A short interview about your role, priorities and tools. Takes about 15 minutes.${afterRestart}`,
     status: scaffolded ? "done" : canStart ? "todo" : "waiting",
     actionLabel: state.onboardAgentId ? "Go back to it" : "Start",
   });
@@ -974,7 +1048,7 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
   if (finished.length || restartForClaude) {
     await updateState((s) => {
       for (const id of finished) delete s.handoffs?.[id];
-      if (restartForClaude) s.restartDaemon = process.ppid;
+      if (restartForClaude) markRestartFor(s, "claude-signin");
     });
   }
   let watching = false;
@@ -985,15 +1059,23 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
     const where = handoff.kind === "chat" ? `the "${handoff.name}" chat` : `the "${handoff.name}" terminal tab`;
     return { ...step, detail: `Running in ${where}. Finish there; this step updates on its own when it is done. ${step.detail}` };
   });
+  const settled = shown.map((step) =>
+    state.skipped.includes(step.id) && step.status !== "done" && step.skippable
+      ? { ...step, status: "skipped" as const }
+      : step,
+  );
+  const restart = await restartView(settled.filter((step) => ["todo", "needs-you", "failed"].includes(step.status)).length);
   return {
-    steps: shown.map((step) =>
-      state.skipped.includes(step.id) && step.status !== "done" && step.skippable
-        ? { ...step, status: "skipped" as const }
-        : step,
-    ),
+    // Steps stay "done" on the wire so an older setup page still reads this answer; the page shows
+    // the ones listed in restartSteps as "Waiting for restart".
+    steps: settled,
+    restartSteps: settled.filter((step) => step.status === "done" && restart.steps.includes(step.id)).map((step) => step.id),
     folder,
     workspaceId: state.workspaceId,
-    restartNeeded: restartForClaude || Boolean(state.restartDaemon && state.restartDaemon === process.ppid),
+    restartNeeded: restart.needed,
+    restartFor: restart.names,
+    restartNow: restart.now,
+    restartPickedUp: restart.pickedUp,
     watching,
   };
 }
@@ -1054,12 +1136,9 @@ async function installPlugins(folder: string, includeClaude: boolean) {
   const installed = await paseoPluginInventory();
   if (!installed) throw new Error("Could not list your Paseo plugins. Check Paseo is open, then press Add them again.");
   let changed = false;
-  // Paseo loads a new or re-enabled plugin only after a full restart, so keep the restart banner up
-  // until then (an automatic install otherwise finished with the step "done" and no instruction).
-  const needsRestart = () =>
-    updateState((state) => {
-      state.restartDaemon = process.ppid;
-    });
+  // Paseo 0.16 starts a plugin as soon as it is installed or enabled (observed in testing, and in
+  // Paseo's install path). Ask for a restart only if one is still not running afterwards.
+  const needsRestart = async () => undefined;
   for (const plugin of paseoPlugins) {
     const state = pluginState(installed, plugin.id);
     if (state === "running") continue;
@@ -1077,7 +1156,26 @@ async function installPlugins(folder: string, includeClaude: boolean) {
     changed = true;
     await needsRestart();
   }
-  return changed ? "Quit and reopen Paseo to see them." : "";
+  const after = await paseoPluginInventory();
+  // Could not read the list: say so rather than guess either way.
+  if (!after) return changed ? "Added. Press Check again to confirm they are running." : "";
+  const waiting = paseoPlugins.filter((plugin) => pluginState(after, plugin.id) !== "running");
+  if (!waiting.length) {
+    // All running: an older "plugins" restart reason no longer applies; other reasons stay.
+    await updateState((state) => {
+      if (!state.restartFor?.includes("plugins")) return;
+      state.restartFor = state.restartFor.filter((id) => id !== "plugins");
+      if (!state.restartFor.length) {
+        delete state.restartFor;
+        delete state.restartDaemon;
+      }
+    });
+    return changed ? "Added. They are running now." : "";
+  }
+  await updateState((state) => {
+    markRestartFor(state, "plugins");
+  });
+  return "Quit and reopen Paseo to finish adding them.";
 }
 
 async function regenerateCodex(folder: string) {
@@ -1255,6 +1353,10 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
     });
   const startAgent = async (prompt: string, title: string) => {
     await requireAccount();
+    const now = await loadState();
+    if (now.restartDaemon === process.ppid && (now.restartFor ?? []).some((id) => id === "claude-signin" || id === "claude-install")) {
+      throw new Error("Restart Paseo first, so it picks up Claude. Fully quit it and open it again; your progress is saved.");
+    }
     const workspace = await openWorkspace();
     const agent = await workspace.agents.create({ config: CLAUDE_AGENT, title, prompt });
     await handedOff("chat", title);
@@ -1288,7 +1390,7 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
   };
   const markRestart = () =>
     updateState((state) => {
-      state.restartDaemon = process.ppid;
+      markRestartFor(state, stepId);
     });
   const confirm = (id: string) =>
     updateState((state) => {

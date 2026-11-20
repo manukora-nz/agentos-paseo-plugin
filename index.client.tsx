@@ -1,5 +1,6 @@
 import type { PluginClientContext, PluginSidebarItemProps } from "@getpaseo/plugin/client";
 import { SidebarRow } from "@getpaseo/plugin/client/ui";
+import { RestartItem } from "./client/restart-item";
 import { SetupScreen } from "./client/setup-screen";
 
 function SetupItem({ currentScreen, openScreen }: PluginSidebarItemProps) {
@@ -15,6 +16,7 @@ function SetupItem({ currentScreen, openScreen }: PluginSidebarItemProps) {
 export default function contribute(client: PluginClientContext) {
   client.addScreen({ id: "setup", title: "AgentOS setup", Component: SetupScreen });
   client.addSidebarHeaderItem({ id: "setup", title: "AgentOS setup", Component: SetupItem });
+  client.addSidebarFooterItem({ id: "restart", title: "Restart Paseo to finish setup", Component: RestartItem });
   client.addCommandCenterItem({
     id: "open-setup",
     title: "Open AgentOS setup",
