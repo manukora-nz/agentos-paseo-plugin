@@ -1,4 +1,5 @@
-import { chmod, copyFile, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import type { Step, StatusResult } from "../shared/contracts";
@@ -25,6 +26,8 @@ import { CLAUDE_INSTALL_ARGS, CLAUDE_WINGET_ARGS, ensureClaudeOnUserPath, instal
 import { bundleFile, bundledRepo, sourceDir, stateDir } from "./util";
 import { identityToken, signIn, signedInEmail } from "./google";
 import { connect, downloadAfterSignIn, fileReport, loadService, refreshSource, teamKeys } from "./source";
+import { captureSlack, checkIdentity, realCaptureDeps, setPinnedForTests, slackIdentity, SLACK_DOMAIN, type AuthInfo, type CaptureDeps } from "./slack-connect";
+import { deleteSession, markDisconnected, readStoredSession, saveSession, storeName, type SlackSession } from "./slack-store";
 
 // The Paseo SDK surface this plugin uses.
 export interface Paseo {
@@ -57,10 +60,9 @@ function invalidateStatus() {
 const STATUS_TTL_MS = 20000;
 const CONNECTOR_TTL_MS = 120000;
 const CLAUDE_AGENT = { provider: "claude/claude-opus-5-5", modeId: "auto" };
-const SLACK_STEPS =
-  "In Chrome, open app.slack.com and press Command-Option-J (on Windows: Ctrl-Shift-J). Paste this line, then copy the xoxc- value without quotes: " +
-  "JSON.parse(localStorage.localConfig_v2).teams[Object.keys(JSON.parse(localStorage.localConfig_v2).teams)[0]].token. " +
-  "Chrome may ask you to type allow pasting first. Then open Application, Cookies, app.slack.com, and copy the value of d. Never paste these into a chat.";
+const SLACK_CONNECT_TEXT =
+  "Press Connect Slack: a separate Chrome window opens on Slack. Sign in there with your Manukora Slack account and this step finishes on its own; the window then closes and is deleted. " +
+  "AgentOS keeps the sign-in on this computer only so it can create drafts in your Slack. It never sends.";
 
 const ok = (value?: string) => (value ?? "").startsWith("ok");
 
@@ -263,8 +265,14 @@ function applyJob(step: Step): Step {
     const hint = isWindows && (step.id === "tools" || step.id === "claude-install" || step.id === "devtools")
       ? " Windows asks for permission for each install: look for a flashing shield icon in the taskbar at the bottom of the screen, click it and choose Yes. Installs can take 5 to 10 minutes."
       : "";
+    if (step.id === "slack-drafts") {
+      return { ...step, status: "working", detail: "Waiting for you to sign in to Manukora's Slack in the Chrome window that opened. This finishes on its own; the window then closes." };
+    }
     return { ...step, status: "working", detail: `Working on it...${hint}` };
   }
+  // A failed Slack attempt never hides the card's real state (connected, signed out): say what went wrong.
+  if (current?.error && step.id === "slack-drafts") return { ...step, detail: `${step.detail} Last attempt: ${current.error}` };
+  if (current?.note && step.id === "slack-drafts") return { ...step, detail: `${step.detail} ${current.note}` };
   if (current?.error && step.status !== "done") return { ...step, status: "failed", detail: current.error };
   if (current?.note && step.status !== "done") return { ...step, detail: `${step.detail} ${current.note}` };
   return step;
@@ -305,6 +313,7 @@ export const RESTART_NAMES: Record<string, string> = {
   onboard: "your onboarding",
   "shared-keys": "your team keys",
   "slack-drafts": "Slack drafts",
+  "slack-disconnect": "Slack drafts",
   "role-tools": "your role tools",
   codex: "Codex",
 };
@@ -895,23 +904,67 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
     skippable: keysIn && !ffmpegOk,
   });
 
-  const slackIn = hasFolder && (await keyIsSet(folder, "SLACK_MCP_XOXC_TOKEN"));
+  const slackRead = hasFolder ? await readStoredSession() : ({ state: "missing" } as const);
+  const slackSession = slackRead.state === "ok" ? slackRead.session : null;
+  // "The older way" only before the first Connect: after a Disconnect a kept copy is not a connection.
+  const slackLegacy = slackRead.state === "missing" && hasFolder && (await legacySlackPair(folder)) !== null;
+  // A Disconnect whose settings change did not finish: drafts already refuse, but keep it retryable.
+  const disconnectUnfinished = slackRead.state === "disconnected" && hasFolder && (await enabledInSettings(folder, "slack-drafts"));
+  const slackHealth = slackSession ? await slackStillWorks(slackSession) : "unknown";
+  const store = storeName();
+  // The setup plugin can be newer than the folder: until the folder has the session reader, Connect
+  // Slack would save a sign-in that folder cannot use and remove the copies it still needs.
+  const slackFolderOk = !hasFolder || (await slackFolderReady(folder));
+  const readingOn = slackLegacy && (await slackReadingServerMayRun(folder));
   add({
     id: "slack-drafts",
     group: "Full capability",
     title: "Slack drafts",
-    detail: slackIn
-      ? "Messages AgentOS writes land in your Slack Drafts. Nothing ever sends. If Slack stops working, enter fresh values here."
-      : SLACK_STEPS,
-    status: slackIn ? "done" : live ? "needs-you" : "waiting",
-    actionLabel: "Save",
+    detail:
+      slackRead.state === "error"
+        ? `AgentOS could not read your ${store}. Unlock it (or sign in to this computer again), then press Check again.`
+        : slackSession
+          ? slackHealth === "signed-out"
+            ? "Slack has signed this session out (for example after you signed out of Slack). Press Reconnect Slack and sign in again."
+            : `Connected as ${slackSession.user || "you"} in Manukora's Slack. AgentOS keeps your Slack sign-in in your ${store} so it can create drafts in your Slack, and it never sends. Disconnect below removes it.`
+          : !slackFolderOk
+            ? "Update AgentOS first (Bring AgentOS up to date, above), then press Connect Slack."
+            : slackLegacy
+              ? readingOn
+                ? `Connected the older way, with the values in plain files. Press Connect Slack to move Slack drafts into your ${store}. Your optional Slack reading tools are switched on and keep using their own copy in plain files; that copy is removed only if you switch them off.`
+                : `Connected the older way, with the values in plain files. Press Connect Slack to move them into your ${store} and remove the plain copies.`
+              : SLACK_CONNECT_TEXT,
+    status:
+      slackRead.state === "error"
+        ? "needs-you"
+        : slackSession
+          ? slackHealth === "signed-out"
+            ? "needs-you"
+            : "done"
+          : slackLegacy
+            ? "done"
+            : live && slackFolderOk
+              ? "needs-you"
+              : "waiting",
+    actionLabel: slackRead.state === "error" || (!slackFolderOk && !slackSession) ? undefined : slackSession ? "Reconnect Slack" : "Connect Slack",
     skippable: true,
-    repeatable: Boolean(slackIn && live),
-    inputs: [
-      { key: "xoxc", label: "xoxc- value", secret: true, value: "" },
-      { key: "xoxd", label: "d cookie value", secret: true, value: "" },
-    ],
+    repeatable: Boolean((slackSession || slackLegacy) && live),
   });
+  if (slackSession || slackLegacy || disconnectUnfinished) {
+    add({
+      id: "slack-disconnect",
+      group: "Full capability",
+      title: "Switch Slack account",
+      detail: disconnectUnfinished
+        ? "Disconnect did not finish switching Slack drafts off. Press Disconnect again."
+        : slackSession
+          ? `Removes the saved Slack sign-in (${slackSession.user || "this account"}) from this computer and switches Slack drafts off. Use it before connecting a different Slack account.`
+          : "Stops AgentOS using the older Slack setup and switches Slack drafts off. Connect Slack then tidies the older plain copies. Use it before connecting a different Slack account.",
+      status: disconnectUnfinished ? "needs-you" : "done",
+      actionLabel: "Disconnect",
+      repeatable: true,
+    });
+  }
 
   const roleServers = hasFolder ? await roleServerPicks(folder, intake) : [];
   const roleOff = roleServers.filter((s) => !s.enabled).map((s) => s.name);
@@ -1310,24 +1363,300 @@ export async function verifySlackOrThrow(xoxc: string, xoxd: string, send: typeo
   if (!accepted) throw new Error("Slack did not accept those values, so nothing was changed. Copy both again from the same Slack session.");
 }
 
-async function saveSlack(folder: string, xoxc: string, xoxd: string) {
-  if (!testMode) await verifySlackOrThrow(xoxc, xoxd);
-  await ensureLocalKeysFile(folder);
-  const dir = await mkdtemp(path.join(os.tmpdir(), "agentos-slack-"));
+// ---- Connect Slack (AIS-479) ----
+
+let slackCaptureDeps: CaptureDeps = realCaptureDeps;
+let identify: (xoxc: string, xoxd: string) => Promise<AuthInfo> = (xoxc, xoxd) => slackIdentity(xoxc, xoxd);
+export function setSlackForTests(parts: { capture?: CaptureDeps; identify?: typeof identify; teamId?: string }) {
+  if (!testMode) return;
+  if (parts.teamId) setPinnedForTests(parts.teamId);
+  if (parts.capture) slackCaptureDeps = parts.capture;
+  if (parts.identify) identify = parts.identify;
+}
+
+let slackCancelled = false;
+
+let slackChain: Promise<unknown> = Promise.resolve();
+function withSlackLock<T>(work: () => Promise<T>): Promise<T> {
+  const next = slackChain.then(work, work);
+  slackChain = next.catch(() => undefined);
+  return next;
+}
+
+// Saves only after Slack confirms the workspace and the person; a failure leaves the working pair alone.
+const SLACK_FOLDER_FIRST = "Update AgentOS first (Bring AgentOS up to date), then press Connect Slack. Nothing was changed.";
+async function slackFolderReady(folder: string) {
+  return exists(path.join(folder, "scripts", "slack_session.py"));
+}
+
+export async function connectSlack(folder: string, pair: { xoxc: string; xoxd: string; teamId: string }, cancelled: () => boolean = () => false) {
+  if (!(await slackFolderReady(folder))) throw new Error(SLACK_FOLDER_FIRST);
+  // Preflight: settings must be readable before anything changes, so a later step cannot fail halfway.
   try {
-    const first = path.join(dir, "a");
-    const second = path.join(dir, "b");
-    await writeFile(first, xoxc, { mode: 0o600 });
-    await writeFile(second, xoxd, { mode: 0o600 });
-    const args = ["-NoProfile", "-File", "scripts/set-slack-tokens.ps1", "-XoxcFile", first, "-XoxdFile", second, "-DeleteSourceFiles"];
-    args.push("-SkipVerify");
-    if (testMode) args.push("-ProfilePath", path.join(path.dirname(folder), "plugin-test-zprofile"));
-    const result = await run("pwsh", args, { cwd: folder, timeoutMs: 90000 });
-    if (result.code !== 0) throw new Error(`Saving Slack did not finish: ${scrubValues(lastLines(result.out), [xoxc, xoxd])}`);
-      } finally {
-    await rm(dir, { recursive: true, force: true });
+    JSON.parse(await readFile(path.join(folder, ".claude/settings.json"), "utf8"));
+  } catch {
+    throw new Error("Could not read .claude/settings.json in your AgentOS folder. Nothing was changed.");
   }
-  await chmod(path.join(folder, ".env"), 0o600);
+  const info = await identify(pair.xoxc, pair.xoxd).catch(() => {
+    throw new Error("Could not reach Slack to check the session. Nothing was changed.");
+  });
+  const problem = checkIdentity(info);
+  if (problem) throw new Error(problem);
+  if (pair.teamId && pair.teamId !== info.teamId) throw new Error("Slack answered for a different workspace than the one signed in. Nothing was saved.");
+  // The person already set up: the store, or before the first Connect the older plain setup.
+  // After an explicit Disconnect there is nobody to compare against: Disconnect was the confirmation.
+  const stored = await readStoredSession();
+  if (stored.state === "error") throw new Error(`Could not read your ${storeName()}, so the Slack account could not be checked. Nothing was changed.`);
+  let previousUser = stored.state === "ok" ? { id: stored.session.userId, name: stored.session.user } : null;
+  if (stored.state === "missing") {
+    const legacy = await legacySlackPair(folder);
+    if (legacy) {
+      const unknown = () =>
+        new Error('Could not tell whose older Slack setup is on this computer. Press Disconnect on "Switch Slack account" to confirm it can be replaced, then press Connect Slack. Nothing was changed.');
+      // A 1Password reference or an inherited value cannot be checked here: confirm by Disconnect.
+      if (legacy.unresolved) throw unknown();
+      const old = await identify(legacy.xoxc, legacy.xoxd).catch(() => null);
+      if (!old) throw new Error("Could not reach Slack to check the older Slack setup on this computer. Nothing was changed; try again.");
+      // Only a session Slack says is dead belongs to nobody; any other unclear answer needs confirming.
+      const dead = !old.ok && SLACK_SIGNED_OUT.has(old.error ?? "");
+      if (old.ok && old.userId) previousUser = { id: old.userId, name: old.user };
+      else if (!dead) throw unknown();
+    }
+  }
+  if (previousUser?.id && previousUser.id !== info.userId) {
+    throw new Error(
+      `That is a different Slack account (${info.user || "unknown"}) from the one already set up (${previousUser.name || "unknown"}). To switch, press Disconnect on "Switch Slack account" first. Nothing was changed.`,
+    );
+  }
+  if (cancelled()) throw new Error("Connect Slack was cancelled. Nothing was saved.");
+  const session: SlackSession = {
+    xoxc: pair.xoxc,
+    xoxd: pair.xoxd,
+    teamId: info.teamId,
+    userId: info.userId,
+    user: info.user,
+    domain: SLACK_DOMAIN,
+    savedAt: new Date().toISOString(),
+  };
+  try {
+    await saveSession(session);
+  } catch (error) {
+    // Put back exactly what was there before, and say so if that also fails.
+    const undo =
+      stored.state === "ok"
+        ? saveSession(stored.session)
+        : stored.state === "disconnected"
+          ? markDisconnected()
+          : deleteSession();
+    const undone = await undo.then(() => true, () => false);
+    throw new Error(`${(error as Error).message}${undone ? " The previous state was put back." : " The previous state could not be put back; press Connect Slack again."}`);
+  }
+  forgetSlackHealth();
+  // Drafts on first (only drafts: the optional Slack reading server is left exactly as it was), so a
+  // settings failure never follows a cleanup; older copies are removed only once that has worked.
+  await enableServers(folder, ["slack-drafts"]);
+  const removed = await removeOldSlackCopies(folder);
+  return `Connected as ${info.user || "you"}.${removed ? ` ${removed}` : ""}`;
+}
+
+// The older setup's pair, read the way scripts/run-with-env.ps1 reads .env (trimmed, quotes removed,
+// the last non-empty assignment wins), then this process's environment.
+async function legacySlackPair(folder: string, includeEnvironment = true) {
+  const values: Record<string, string> = {};
+  for (const raw of (await readIfThere(path.join(folder, ".env"))).split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const at = line.indexOf("=");
+    if (at < 0) continue;
+    const key = line.slice(0, at).trim();
+    const value = line.slice(at + 1).trim().replace(/^"+|"+$/g, "").replace(/^'+|'+$/g, "");
+    if (value) values[key] = value;
+  }
+  const fromEnv = (key: string) => (includeEnvironment ? process.env[key] ?? "" : "");
+  const xoxc = values.SLACK_MCP_XOXC_TOKEN || fromEnv("SLACK_MCP_XOXC_TOKEN");
+  const xoxd = values.SLACK_MCP_XOXD_TOKEN || fromEnv("SLACK_MCP_XOXD_TOKEN");
+  if (!xoxc && !xoxd) return null;
+  const unresolved = !xoxc || !xoxd || xoxc.startsWith("op://") || xoxd.startsWith("op://");
+  return { xoxc, xoxd, unresolved };
+}
+
+const SLACK_HEALTH_TTL_MS = 10 * 60 * 1000;
+let slackHealth: { key: string; at: number; result: "ok" | "signed-out" | "unknown" } | null = null;
+function forgetSlackHealth() {
+  slackHealth = null;
+}
+export function forgetSlackHealthForTests() {
+  if (testMode) slackHealth = null;
+}
+
+// A cached check that the saved session still works, so the step can offer Reconnect.
+// Slack answers that mean this session will not work again (connectSlack treats them as dead too).
+const SLACK_SIGNED_OUT = new Set(["invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired"]);
+
+async function slackStillWorks(session: SlackSession): Promise<"ok" | "signed-out" | "unknown"> {
+  const key = `${session.userId}:${session.savedAt}`;
+  if (slackHealth && slackHealth.key === key && Date.now() - slackHealth.at < SLACK_HEALTH_TTL_MS) return slackHealth.result;
+  let result: "ok" | "signed-out" | "unknown" = "unknown";
+  try {
+    const info = await identify(session.xoxc, session.xoxd);
+    result = info.ok ? "ok" : SLACK_SIGNED_OUT.has(String(info.error)) ? "signed-out" : "unknown";
+  } catch {}
+  slackHealth = { key, at: Date.now(), result };
+  return result;
+}
+
+// Exactly the lines the older AgentOS setup wrote (scripts/set-slack-tokens.ps1): `export KEY='value'`
+// at the start of a line, single-quoted, nothing after it. A Slack line in any other form (indented,
+// double-quoted, with a comment, without export) was written by the person or another tool and stays.
+// A value counts only if that script would have accepted it: xoxc `^xoxc-[A-Za-z0-9._-]+$` (prefix checked
+// case-insensitively, as PowerShell did), xoxd `^[A-Za-z0-9%+/=._-]+$`, at least 40 long, not an xoxc.
+// Anything else on such a line is the person's and stays.
+const EXPORT_LINE = /^export (SLACK_MCP_XOXC_TOKEN|SLACK_MCP_XOXD_TOKEN)='([^'\r\n]*)'\r?$/;
+function isAgentosSlackLine(line: string) {
+  const m = EXPORT_LINE.exec(line);
+  if (!m) return false;
+  const value = m[2];
+  if (m[1] === "SLACK_MCP_XOXC_TOKEN") return /^xoxc-/i.test(value) && /^[A-Za-z0-9._-]+$/.test(value);
+  return /^[A-Za-z0-9%+/=._-]+$/.test(value) && value.length >= 40 && !/^xoxc-/i.test(value);
+}
+const ANY_SLACK_LINE = /^\s*(export\s+)?SLACK_MCP_XOX[CD]_TOKEN\s*=/;
+
+// Removes only AgentOS's own export lines from one file and leaves every other byte as it was: other
+// lines, blank lines, line endings, the file's permissions, and a symlinked profile (the link's
+// target is edited, the link stays). Returns whether anything was removed and whether a Slack line
+// that AgentOS did not write is still there.
+export async function stripAgentosSlackLines(file: string): Promise<{ removed: boolean; othersLeft: boolean }> {
+  let target: string;
+  try {
+    target = await realpath(file);
+  } catch {
+    return { removed: false, othersLeft: false };
+  }
+  const info = await stat(target);
+  if (!info.isFile()) return { removed: false, othersLeft: false };
+  const text = await readFile(target, "utf8");
+  const lines = text.split("\n");
+  const kept = lines.filter((line) => !isAgentosSlackLine(line));
+  const othersLeft = kept.some((line) => ANY_SLACK_LINE.test(line));
+  if (kept.length === lines.length) return { removed: false, othersLeft };
+  const mode = info.mode & 0o777;
+  // A fresh, unguessable name created exclusively ("wx"), removed again if anything fails.
+  const tmp = `${target}.agentos-tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
+  try {
+    await writeFile(tmp, kept.join("\n"), { mode, flag: "wx" });
+    await chmod(tmp, mode);
+    // Something else (an editor, a dotfile manager) may have saved the profile meanwhile: replace it
+    // only if it is still the same file with the same contents, otherwise leave it alone.
+    const now = await stat(target);
+    if (now.ino !== info.ino || now.size !== info.size || now.mtimeMs !== info.mtimeMs || (await readFile(target, "utf8")) !== text) {
+      await rm(tmp, { force: true });
+      return { removed: false, othersLeft };
+    }
+    await rename(tmp, target);
+  } catch (error) {
+    await rm(tmp, { force: true }).catch(() => undefined);
+    throw error;
+  }
+  return { removed: true, othersLeft };
+}
+
+// The older setup left the pair in plain text: a login-profile export (and its backups) on a Mac, user
+// environment variables on Windows, and .env. Remove those copies; .env keeps them only while the
+// optional Slack reading server is switched on, because that server still reads .env.
+async function removeOldSlackCopies(folder: string) {
+  const notes: string[] = [];
+  // The optional Slack reading server still uses the older copies (from .env, the login profile or
+  // Windows user settings): while it can run, leave every one of them in place.
+  if (await slackReadingServerMayRun(folder)) {
+    return "The optional Slack reading tools keep using their own older copy; switch them off to have it removed.";
+  }
+  const envFile = path.join(folder, ".env");
+  const envText = await readIfThere(envFile);
+  if ((await legacySlackPair(folder, false)) !== null || /^\s*SLACK_MCP_XOX[CD]_TOKEN\s*=\s*\S/m.test(envText)) {
+    await writeFile(envFile, envText.replace(/^(\s*SLACK_MCP_XOX[CD]_TOKEN\s*)=.*$/gm, "$1="), { mode: 0o600 });
+    notes.push("Removed the plain copy from .env.");
+  }
+  if (isWindows) {
+    if (!testMode) {
+      const cleared = await run("powershell.exe", [
+        "-NoProfile",
+        "-Command",
+        "foreach ($k in 'SLACK_MCP_XOXC_TOKEN','SLACK_MCP_XOXD_TOKEN') { if ([Environment]::GetEnvironmentVariable($k, 'User')) { [Environment]::SetEnvironmentVariable($k, $null, 'User'); Write-Output 'removed' } }; if ([Environment]::GetEnvironmentVariable('SLACK_MCP_XOXC_TOKEN', 'User') -or [Environment]::GetEnvironmentVariable('SLACK_MCP_XOXD_TOKEN', 'User')) { exit 1 }",
+      ]);
+      // Say "removed" only when there was something to remove (a new PC never had these).
+      if (cleared.code !== 0) notes.push("Could not remove the plain copy from your Windows user settings; AI & Systems can help.");
+      else if (cleared.out.includes("removed")) notes.push("Removed the plain copy from your Windows user settings.");
+    }
+  } else {
+    const profile = testMode ? path.join(path.dirname(folder), "plugin-test-zprofile") : path.join(os.homedir(), ".zprofile");
+    const dir = path.dirname(profile);
+    const name = path.basename(profile);
+    const files = [profile];
+    try {
+      // Backups the older setup made before it edited the profile.
+      for (const entry of await readdir(dir)) {
+        if (!entry.startsWith(`${name}.agentos-backup-`)) continue;
+        const full = path.join(dir, entry);
+        if ((await lstat(full)).isFile()) files.push(full);
+      }
+    } catch {}
+    let cleaned = 0;
+    let othersLeft = false;
+    for (const file of files) {
+      try {
+        const result = await stripAgentosSlackLines(file);
+        if (result.removed) cleaned += 1;
+        if (result.othersLeft && file === profile) othersLeft = true;
+      } catch {
+        notes.push(`Could not tidy ${path.basename(file)}; nothing in it was changed.`);
+      }
+    }
+    if (cleaned) notes.push(`Removed the plain copy AgentOS had put in your login profile${cleaned > 1 ? " and its backups" : ""}.`);
+    if (othersLeft) notes.push("Your login profile still has a Slack line AgentOS did not write; it was left as it is. AgentOS uses the saved sign-in, not that line.");
+  }
+  return notes.join(" ");
+}
+
+// Whether the optional Slack reading server can start: either settings file enables it, or every
+// project server is enabled. Unreadable settings count as "maybe", so .env is kept.
+async function slackReadingServerMayRun(folder: string) {
+  for (const name of ["settings.json", "settings.local.json"]) {
+    const file = path.join(folder, ".claude", name);
+    let text: string;
+    try {
+      text = await readFile(file, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      return true; // present but unreadable: assume it may run
+    }
+    try {
+      const settings = JSON.parse(text) as { enabledMcpjsonServers?: string[]; enableAllProjectMcpServers?: boolean };
+      if (settings.enableAllProjectMcpServers === true || (settings.enabledMcpjsonServers ?? []).includes("slack")) return true;
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function enabledInSettings(folder: string, name: string) {
+  try {
+    return ((JSON.parse(await readFile(path.join(folder, ".claude/settings.json"), "utf8")) as { enabledMcpjsonServers?: string[] }).enabledMcpjsonServers ?? []).includes(name);
+  } catch {
+    return false;
+  }
+}
+
+async function disableServers(folder: string, names: string[]) {
+  const file = path.join(folder, ".claude/settings.json");
+  const raw = await readFile(file, "utf8");
+  const settings = JSON.parse(raw) as { enabledMcpjsonServers?: string[]; disabledMcpjsonServers?: string[] };
+  settings.enabledMcpjsonServers = (settings.enabledMcpjsonServers ?? []).filter((s) => !names.includes(s));
+  settings.disabledMcpjsonServers = [...new Set([...(settings.disabledMcpjsonServers ?? []), ...names])];
+  const backups = path.join(folder, "data/backups");
+  await mkdir(backups, { recursive: true });
+  await writeFile(path.join(backups, `settings.json.plugin.${Date.now()}`), raw);
+  await writeFile(file, `${JSON.stringify(settings, null, 2)}\n`);
   await regenerateCodex(folder);
 }
 
@@ -1541,12 +1870,46 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
     }
     case "slack-drafts": {
       const folder = await currentFolder();
-      const xoxc = values.xoxc?.trim() ?? "";
-      const xoxd = values.xoxd?.trim() ?? "";
-      if (!slackValuesLookRight(xoxc, xoxd)) throw new Error("Those values do not look right. Copy both again.");
-      await saveSlack(folder, xoxc, xoxd);
+      // One Slack action at a time: a second press while the window is open does nothing new.
+      if (jobs.get("slack-drafts")?.running) return { message: "The Slack sign-in window is already open. Finish there, or close it to stop." };
+      if (!(await slackFolderReady(folder))) return { message: SLACK_FOLDER_FIRST };
+      slackCancelled = false;
+      startJob("slack-drafts", async () => {
+        const pair = await captureSlack(slackCaptureDeps, () => slackCancelled);
+        try {
+          // Connect and Disconnect never overlap; a Disconnect that came in meanwhile wins.
+          const note = await withSlackLock(async () => {
+            if (slackCancelled) throw new Error("Connect Slack was cancelled. Nothing was saved.");
+            return connectSlack(folder, pair, () => slackCancelled);
+          });
+          await markRestart();
+          // A Disconnect pressed after the save supersedes it: never publish a "Connected as" note then.
+          return slackCancelled ? undefined : note;
+        } catch (error) {
+          throw new Error(scrubValues((error as Error).message, [pair.xoxc, pair.xoxd]));
+        }
+      });
+      return { message: "A Slack window is opening. Sign in there with your Manukora Slack account; this step finishes on its own." };
+    }
+    case "slack-disconnect": {
+      const folder = await currentFolder();
+      // Stop a waiting Connect, then queue behind any save already in progress: the disconnected
+      // marker is always written last and verified before this reports done.
+      slackCancelled = true;
+      await withSlackLock(async () => {
+        slackCancelled = true;
+        // The marker stops the drafts helper at once (it checks the store on every request), even in a
+        // session that is already running, and never lets an older plain copy stand in.
+        await markDisconnected();
+        forgetSlackHealth();
+        await disableServers(folder, ["slack-drafts"]);
+        // An earlier "Connected as ..." note must not stay on the card after Disconnect; any other note
+        // (a Connect that this Disconnect cancelled) is still worth showing.
+        const last = jobs.get("slack-drafts");
+        if (last && !last.running && last.note?.startsWith("Connected as")) jobs.delete("slack-drafts");
+      });
       await markRestart();
-      return { message: "Saved. Fully quit and reopen Paseo to turn it on." };
+      return { message: "Disconnected, and Slack drafts are off. Restart Paseo to finish (a chat that is already open keeps its tools until then). Press Connect Slack to connect again." };
     }
     case "role-tools": {
       const folder = await currentFolder();
