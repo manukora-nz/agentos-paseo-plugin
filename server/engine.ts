@@ -717,10 +717,13 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
       : !signedIn
       ? "Opens a sign-in terminal. Choose your Manukora account in the browser, and if it shows a code, paste it into the terminal and press Enter (the code does not show while you paste)."
       : onTeam
-        ? `Signed in as ${account.email}.`
+        ? `Signed in as ${account.email}. If a chat ever says your Claude session expired or could not be refreshed, press Sign in again and choose your Manukora account.`
         : `Signed in as ${account.email ?? "an account"}, which is not the Manukora Team plan. Your connectors would read the wrong account. Switch accounts, or skip only if you know this is right.`,
     status: signedIn && onTeam ? "done" : !claudeInstalled || !folderReady ? "waiting" : "needs-you",
-    actionLabel: "Open sign-in",
+    // The local sign-in check cannot tell when Claude has ended the session on its side (chats then
+    // fail with "OAuth session expired"), so a signed-in card always offers Sign in again.
+    actionLabel: signedIn ? "Sign in again" : "Open sign-in",
+    repeatable: signedIn && claudeInstalled && folderReady,
     skippable: signedIn,
   });
 
@@ -1691,7 +1694,7 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
     await handedOff("chat", title);
     return { workspaceId: workspace.id, agentId: agent.id };
   };
-  const openTerminal = async (name: string, command: string, args: string[] = []) => {
+  const openTerminal = async (name: string, command: string, args: string[] = [], track = true) => {
     const workspace = await openWorkspace();
     if (isWindows) {
       // PowerShell 7 when it is there, otherwise the one built into Windows.
@@ -1706,7 +1709,7 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
       const target = resolveWindowsCommand(command, searchPath) ?? command;
       const line = `${refresh}; & ${[target, ...args].map(quoteForPowerShell).join(" ")}`;
       await workspace.terminals.create({ name, command: shell, args: ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NoExit", "-Command", line] });
-      await handedOff("terminal", name);
+      if (track) await handedOff("terminal", name);
       return { message: `Opened ${name}. Look for the new terminal tab at the top of the window; this step updates on its own when you finish there.`, workspaceId: workspace.id };
     }
     const resolved = (await run("/usr/bin/which", [command], { timeoutMs: 10000 })).out.split("\n")[0]?.trim();
@@ -1714,7 +1717,7 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
     const target = [resolved?.startsWith("/") ? resolved : command, ...args].map(quoteForShell).join(" ");
     // A login shell gives the terminal the same tools the person has in Terminal.
     await workspace.terminals.create({ name, command: shell, args: ["-lc", `exec ${target}`] });
-    await handedOff("terminal", name);
+    if (track) await handedOff("terminal", name);
     return { message: `Opened ${name}. Look for the new terminal tab at the top of the window; this step updates on its own when you finish there.`, workspaceId: workspace.id };
   };
   const markRestart = () =>
@@ -1809,8 +1812,16 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
         "GitHub access is never needed. When it updates, tell me to restart Paseo.";
       return { message: "Updating your AgentOS.", ...(await startAgent(prompt, "Update AgentOS")) };
     }
-    case "claude-signin":
+    case "claude-signin": {
+      // Signing in again: the step is already done, so it is not tracked as a hand-off (that would
+      // clear at once and ask for a restart while the browser sign-in is still open). New chats start
+      // a fresh Claude that reads the new sign-in, so no restart is needed.
+      if ((await claudeAccount()).loggedIn === true) {
+        const opened = await openTerminal("Claude sign-in", "claude", ["auth", "login"], false);
+        return { ...opened, message: "Opened Claude sign-in in a new terminal tab. Choose your Manukora account in the browser. When the terminal says you are signed in, press Check again and make sure this step shows your Manukora address; then start a new chat. No restart is needed." };
+      }
       return openTerminal("Claude sign-in", "claude", ["auth", "login"]);
+    }
     case "theme":
       await confirm("theme");
       return { message: "Thanks." };
