@@ -37,6 +37,9 @@ export interface State {
   // The chat or terminal a step handed its work to, so the setup page can say where it is running
   // until the step is verified done (or the hand-off is old enough to be stale).
   handoffs?: Record<string, { kind: "chat" | "terminal"; name: string; at: number }>;
+  // After a first Claude sign-in: Paseo is still checking Claude (its provider list says "loading"), so
+  // steps that start a Claude chat wait. Kept per Paseo process; a restart ends the check.
+  claudeCheck?: { since: number; daemon: number };
 }
 
 export async function exists(target: string) {

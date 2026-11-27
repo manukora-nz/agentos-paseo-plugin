@@ -731,8 +731,13 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
   // These steps run in a Claude chat: while Paseo still needs a restart to pick up Claude, wait for it.
   const claudeRestartPending =
     state.restartDaemon === process.ppid && (state.restartFor ?? []).some((id) => id === "claude-signin" || id === "claude-install");
-  const canStart = folderReady && accountAccepted && !claudeRestartPending;
-  const afterRestart = claudeRestartPending ? " Restart Paseo first, so it picks up Claude." : "";
+  const claudeChecking = !claudeRestartPending && (claudeCheckPending(state) || (signedIn && onTeam && signInHandedOff(state)));
+  const canStart = folderReady && accountAccepted && !claudeRestartPending && !claudeChecking;
+  const afterRestart = claudeRestartPending
+    ? " Restart Paseo first, so it picks up Claude."
+    : claudeChecking
+      ? ` ${CLAUDE_CHECKING_TEXT}`
+      : "";
   const behind = folderReady && (await agentosBehind(folder));
   add({
     id: "agentos-update",
@@ -1096,18 +1101,33 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
   const finished = steps.filter((step) => handoffs[step.id] && step.status === "done").map((step) => step.id);
   // Signed in to Claude in a terminal, but Paseo may still show Claude as Unavailable until it
   // re-reads the sign-in. Ask Paseo once; if so, show the restart banner.
+  // After a first sign-in, ask Paseo whether it sees Claude. "loading" is not an answer yet: keep a
+  // separate check (not the terminal hand-off) and ask again on the next poll, up to CLAUDE_CHECK_MS
+  // from the sign-in; still loading after that, or "unavailable"/"error", means a restart.
+  const check = state.claudeCheck;
+  const checkLive = !!check && check.daemon === process.ppid;
   let restartForClaude = false;
-  if (finished.includes("claude-signin")) {
+  let nextCheck: State["claudeCheck"] | null = check && !checkLive ? null : undefined;
+  if (finished.includes("claude-signin") || checkLive) {
+    const since = checkLive ? check!.since : Date.now();
     const providers = await run(paseoCli(), ["provider", "ls", "--json"], { timeoutMs: 15000 });
-    restartForClaude = providers.code === 0 && claudeProviderUnavailable(providers.out);
+    // A failed call is not an answer either: it is asked again within the window, and still no answer
+    // at the end of it means a restart, like a provider that never finishes loading.
+    const claude = providers.code === 0 ? claudeProviderState(providers.out) : "loading";
+    const expired = Date.now() - since > CLAUDE_CHECK_MS;
+    restartForClaude = claude === "unavailable" || (claude === "loading" && expired);
+    nextCheck = claude === "loading" && !expired ? { since, daemon: process.ppid } : checkLive ? null : undefined;
   }
-  if (finished.length || restartForClaude) {
+  if (finished.length || restartForClaude || nextCheck !== undefined) {
     await updateState((s) => {
       for (const id of finished) delete s.handoffs?.[id];
+      if (nextCheck === null) delete s.claudeCheck;
+      else if (nextCheck) s.claudeCheck = nextCheck;
       if (restartForClaude) markRestartFor(s, "claude-signin");
     });
   }
-  let watching = false;
+  // While Paseo is checking Claude, the page polls quickly so the waiting steps free up soon after.
+  let watching = !!nextCheck || finished.includes("claude-signin");
   const shown = steps.map((step) => {
     const handoff = handoffs[step.id];
     if (!handoff || step.status === "done" || step.status === "working" || Date.now() - handoff.at > HANDOFF_FRESH_MS) return step;
@@ -1137,15 +1157,36 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
 }
 
 const HANDOFF_FRESH_MS = 45 * 60 * 1000;
+// How long Setup waits for Paseo to finish checking Claude after a first sign-in.
+const CLAUDE_CHECK_MS = 10 * 60 * 1000;
+const CLAUDE_CHECKING_TEXT = "Paseo is still checking Claude after your sign-in. This updates on its own in a moment.";
 
-export function claudeProviderUnavailable(out: string) {
+// A first sign-in handed to a terminal and not yet checked against Paseo (the next status pass checks it).
+function signInHandedOff(state: State) {
+  const handoff = state.handoffs?.["claude-signin"];
+  return !!handoff && Date.now() - handoff.at <= HANDOFF_FRESH_MS;
+}
+
+// A Claude check left by this Paseo process (one left by an earlier process ended with the restart).
+export function claudeCheckPending(state: State) {
+  return !!state.claudeCheck && state.claudeCheck.daemon === process.ppid;
+}
+
+// "unavailable": Paseo still has not picked up the sign-in, so a restart is needed. "loading": Paseo 0.17
+// is still checking its providers, so the answer is not known yet. Anything unreadable counts as "ok".
+export function claudeProviderState(out: string): "ok" | "loading" | "unavailable" {
   try {
     const list = JSON.parse(out.slice(Math.max(0, out.indexOf("[")))) as Array<{ provider?: string; status?: string }>;
     const claude = Array.isArray(list) ? list.find((p) => p?.provider === "claude") : undefined;
-    return Boolean(claude && claude.status !== "available");
+    if (!claude || claude.status === "available") return "ok";
+    return claude.status === "loading" ? "loading" : "unavailable";
   } catch {
-    return false;
+    return "ok";
   }
+}
+
+export function claudeProviderUnavailable(out: string) {
+  return claudeProviderState(out) === "unavailable";
 }
 
 async function roleServerPicks(folder: string, intake: string) {
@@ -1678,17 +1719,19 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
     if (account.loggedIn !== true || !(isManukoraTeam(account) || state.skipped.includes("claude-signin"))) {
       throw new Error("Sign in to your Manukora Claude account first.");
     }
+    return account;
   };
   const handedOff = (kind: "chat" | "terminal", name: string) =>
     updateState((state) => {
       state.handoffs = { ...(state.handoffs ?? {}), [stepId]: { kind, name, at: Date.now() } };
     });
   const startAgent = async (prompt: string, title: string) => {
-    await requireAccount();
+    const account = await requireAccount();
     const now = await loadState();
     if (now.restartDaemon === process.ppid && (now.restartFor ?? []).some((id) => id === "claude-signin" || id === "claude-install")) {
       throw new Error("Restart Paseo first, so it picks up Claude. Fully quit it and open it again; your progress is saved.");
     }
+    if (claudeCheckPending(now) || (isManukoraTeam(account) && signInHandedOff(now))) throw new Error(CLAUDE_CHECKING_TEXT);
     const workspace = await openWorkspace();
     const agent = await workspace.agents.create({ config: CLAUDE_AGENT, title, prompt });
     await handedOff("chat", title);
@@ -1808,7 +1851,8 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
         `and follow what it prints:\n\npwsh -NoProfile -File ${JSON.stringify(script)} -NodePath .${releaseSource}\n\n` +
         "Use this command even if this folder's own /update skill says the folder cannot be updated: that skill may be " +
         "from an older AgentOS. If the script reports conflicts with my own changes, explain them in plain words and ask " +
-        "me before changing anything. If it prints UP TO DATE, tell me AgentOS is current: that is success, not a block, and " +
+        "me before changing anything. Describe what is new only from the WHAT'S NEW lines it prints, never from commit " +
+        "messages. If it prints UP TO DATE, tell me AgentOS is current: that is success, not a block, and " +
         "GitHub access is never needed. When it updates, tell me to restart Paseo.";
       return { message: "Updating your AgentOS.", ...(await startAgent(prompt, "Update AgentOS")) };
     }

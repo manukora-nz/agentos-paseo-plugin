@@ -18,7 +18,9 @@ export const paseoPlugins: readonly { id: string; title: string; source: string 
   { id: "keep-awake", title: "Keep awake while agents work", source: "paseo-plugins/keep-awake" },
 ];
 
-export const roleConnectors = ["Shopify", "Cin7", "Klaviyo", "Gorgias"] as const;
+// Cin7 is not offered (25 Nov 2026): its connector can write, and the Cin7 data people need is in
+// DataHub (org) and DataHub Finance. Its sign-ins are limited to a few named people who make changes.
+export const roleConnectors = ["Shopify", "Klaviyo", "Gorgias"] as const;
 
 export const coreConnectors = [
   "Notion",

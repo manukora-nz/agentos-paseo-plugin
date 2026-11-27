@@ -35,6 +35,9 @@ export function SetupScreen({ theme, layout, navigation }: PluginScreenProps) {
   const [data, setData] = useState<StatusResult | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  // The step whose action set the notice. A success notice for a step still working in the background
+  // ("Installing Git...") is cleared once a later check shows that step done, so it cannot outlive the job.
+  const noticeFrom = useRef<{ step: string; ok: boolean; wasOpen?: boolean } | null>(null);
   const [busy, setBusy] = useState("");
   const [values, setValues] = useState<Record<string, Record<string, string>>>({});
   const [reportText, setReportText] = useState("");
@@ -55,6 +58,16 @@ export function SetupScreen({ theme, layout, navigation }: PluginScreenProps) {
         if (alive.current && request === latestRequest.current) {
           setData(next);
           setError("");
+          const from = noticeFrom.current;
+          if (from?.ok) {
+            const step = next.steps.find((s) => s.id === from.step);
+            const open = !!step && step.status !== "done";
+            if (from.wasOpen === undefined) from.wasOpen = open;
+            else if (from.wasOpen && !open) {
+              noticeFrom.current = null;
+              setNotice("");
+            }
+          }
         }
       } catch (err) {
         if (alive.current) setError(String(err));
@@ -128,17 +141,20 @@ export function SetupScreen({ theme, layout, navigation }: PluginScreenProps) {
   async function act(step: Step) {
     setBusy(step.id);
     setNotice("");
+    noticeFrom.current = null;
     try {
       const entered: Record<string, string> = {};
       for (const input of step.inputs) entered[input.key] = values[step.id]?.[input.key] ?? input.value;
       const result = await run({ stepId: step.id, values: entered });
       setNotice(result.message);
+      noticeFrom.current = { step: step.id, ok: true };
       setValues((prev) => ({ ...prev, [step.id]: {} }));
       if (result.agentId) navigation?.openAgent?.({ agentId: result.agentId });
       else if (result.workspaceId) navigation?.openWorkspace?.({ workspaceId: result.workspaceId });
       if (step.link) void openExternalUrl(step.link);
     } catch (err) {
       setNotice(err instanceof Error ? err.message : String(err));
+      noticeFrom.current = { step: step.id, ok: false };
     }
     setBusy("");
     void refresh();
