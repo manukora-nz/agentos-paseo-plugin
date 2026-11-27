@@ -88,16 +88,54 @@ interface ClaudeAccount {
   email?: string;
   orgName?: string;
   subscriptionType?: string;
+  // True when `claude auth status` could not be read (slow, failed or garbled), so the sign-in
+  // state below is the last one this server confirmed, or unknown. Not the same as signed out.
+  checkFailed?: boolean;
 }
 
-async function claudeAccount(): Promise<ClaudeAccount> {
-  const result = await run("claude", ["auth", "status"], { timeoutMs: 30000 });
+// The last answer `claude auth status` actually gave in this server process (report #116, AIS-455).
+// Shown on the card when a check fails; never enough on its own to start a chat.
+let lastKnownAccount: ClaudeAccount | null = null;
+
+// Tests only: forget the last confirmed answer, so the never-confirmed path can be exercised.
+export function forgetClaudeAccountForTests() {
+  if (testMode) lastKnownAccount = null;
+}
+
+async function readClaudeAccount(timeoutMs: number): Promise<ClaudeAccount | null> {
+  const result = await run("claude", ["auth", "status"], { timeoutMs });
   try {
-    return JSON.parse(result.out) as ClaudeAccount;
+    const parsed = JSON.parse(result.out) as ClaudeAccount;
+    return parsed && typeof parsed === "object" && typeof parsed.loggedIn === "boolean" ? parsed : null;
   } catch {
-    return {};
+    return null;
   }
 }
+
+// A slow or failed check is retried once, then reported as unknown with the last confirmed state,
+// so only a real "signed out" answer turns the sign-in card to Needs you (AIS-455). Both tries share
+// one budget: a setup button has 30 seconds in Paseo 0.17 before the page reports an error, so a
+// button gets a shorter budget than the status page, which carries on in the background.
+async function claudeAccount(budgetMs = 45000): Promise<ClaudeAccount> {
+  const deadline = Date.now() + budgetMs;
+  let account = await readClaudeAccount(Math.min(30000, budgetMs));
+  const left = deadline - Date.now();
+  if (!account && left >= 3000) account = await readClaudeAccount(Math.min(15000, left));
+  if (account) {
+    lastKnownAccount = account;
+    return account;
+  }
+  return { ...(lastKnownAccount ?? {}), checkFailed: true };
+}
+
+// Budgets for the sign-in check inside a setup button, which must answer within Paseo's 30 seconds.
+// Tests set AGENTOS_TEST_AUTH_BUDGET_MS to exercise a slow check without waiting 15 seconds.
+const authBudget = (ms: number) => (testMode && Number(process.env.AGENTOS_TEST_AUTH_BUDGET_MS)) || ms;
+// As in 2.4.3 (one 30 s try), a slow computer can still start a setup chat: up to 28 s for the check,
+// both tries included. Opening the chat may then pass Paseo's 30 s and show an error while it still
+// opens; a second press meanwhile is refused, so it never opens twice (whole-release review).
+const ACTION_AUTH_BUDGET_MS = 28000;
+const SIGNIN_AUTH_BUDGET_MS = 20000;
 
 export function isManukoraTeam(account: ClaudeAccount) {
   return (
@@ -705,21 +743,29 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
         ],
   });
 
-  const account = claudeInstalled ? await claudeAccount() : {};
+  const account: ClaudeAccount = claudeInstalled ? await claudeAccount() : {};
   const signedIn = account.loggedIn === true;
   const onTeam = isManukoraTeam(account);
+  // Could not read the sign-in and no earlier answer to fall back on: say so, never "Needs you".
+  const unknownSignIn = account.checkFailed === true && account.loggedIn === undefined;
+  // Could not re-check, so the card shows the last answer and says it is not current.
+  const notRechecked = account.checkFailed === true && !unknownSignIn
+    ? " (Could not re-check just now; this is the last answer. Press Check again in a moment.)"
+    : "";
   add({
     id: "claude-signin",
     group: "AgentOS",
     title: "Sign in to Claude",
     detail: !claudeInstalled || !folderReady
       ? `Waiting for ${[...(!claudeInstalled ? ["Install Claude Code"] : []), ...(!folderReady ? ["Create your AgentOS folder"] : [])].join(" and ")} above.`
-      : !signedIn
+      : unknownSignIn
+      ? "Could not read your Claude sign-in just now. Press Check again in a moment; you only need to sign in if it then says you are signed out."
+      : (!signedIn
       ? "Opens a sign-in terminal. Choose your Manukora account in the browser, and if it shows a code, paste it into the terminal and press Enter (the code does not show while you paste)."
       : onTeam
         ? `Signed in as ${account.email}. If a chat ever says your Claude session expired or could not be refreshed, press Sign in again and choose your Manukora account.`
-        : `Signed in as ${account.email ?? "an account"}, which is not the Manukora Team plan. Your connectors would read the wrong account. Switch accounts, or skip only if you know this is right.`,
-    status: signedIn && onTeam ? "done" : !claudeInstalled || !folderReady ? "waiting" : "needs-you",
+        : `Signed in as ${account.email ?? "an account"}, which is not the Manukora Team plan. Your connectors would read the wrong account. Switch accounts, or skip only if you know this is right.`) + notRechecked,
+    status: signedIn && onTeam ? "done" : !claudeInstalled || !folderReady || unknownSignIn ? "waiting" : "needs-you",
     // The local sign-in check cannot tell when Claude has ended the session on its side (chats then
     // fail with "OAuth session expired"), so a signed-in card always offers Sign in again.
     actionLabel: signedIn ? "Sign in again" : "Open sign-in",
@@ -1098,7 +1144,10 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
 
   // Hand-offs: say where a step is running until it is verified done, then forget it.
   const handoffs = state.handoffs ?? {};
-  const finished = steps.filter((step) => handoffs[step.id] && step.status === "done").map((step) => step.id);
+  // A sign-in hand-off ends only on a fresh answer, never on the last confirmed one (AIS-455).
+  const finished = steps
+    .filter((step) => handoffs[step.id] && step.status === "done" && !(step.id === "claude-signin" && account.checkFailed))
+    .map((step) => step.id);
   // Signed in to Claude in a terminal, but Paseo may still show Claude as Unavailable until it
   // re-reads the sign-in. Ask Paseo once; if so, show the restart banner.
   // After a first sign-in, ask Paseo whether it sees Claude. "loading" is not an answer yet: keep a
@@ -1130,9 +1179,14 @@ async function computeStatus(refresh: boolean): Promise<StatusResult> {
   let watching = !!nextCheck || finished.includes("claude-signin");
   const shown = steps.map((step) => {
     const handoff = handoffs[step.id];
-    if (!handoff || step.status === "done" || step.status === "working" || Date.now() - handoff.at > HANDOFF_FRESH_MS) return step;
+    // A sign-in shown as done only from the last answer is still running (it ends on a fresh one).
+    const unverified = step.id === "claude-signin" && account.checkFailed === true;
+    if (!handoff || (step.status === "done" && !unverified) || step.status === "working" || Date.now() - handoff.at > HANDOFF_FRESH_MS) return step;
     watching = true;
     const where = handoff.kind === "chat" ? `the "${handoff.name}" chat` : `the "${handoff.name}" terminal tab`;
+    if (unverified) {
+      return { ...step, detail: `Checking your Claude sign-in from ${where}. If you have finished there, this updates on its own once the check answers. ${step.detail}` };
+    }
     return { ...step, detail: `Running in ${where}. Finish there; this step updates on its own when it is done. ${step.detail}` };
   });
   const settled = shown.map((step) =>
@@ -1323,6 +1377,10 @@ async function installFolder(values: Record<string, string>, fallback: string) {
     await run("git", ["-C", folder, "branch", "--unset-upstream"]);
     assertRan(await run("git", ["-C", folder, "config", "user.name", name]), "Saving your name");
     assertRan(await run("git", ["-C", folder, "config", "user.email", email]), "Saving your email");
+    // Browsing works from the first chat, before onboarding: switch on the keyless Playwright
+    // browser (it uses Chrome, or Edge where Chrome is missing). Only for a new folder, so an
+    // existing person's choices are never changed. Onboarding adds the rest.
+    await enableServers(folder, ["playwright"]);
   }
   await updateState((state) => {
     state.folder = folder;
@@ -1704,7 +1762,24 @@ async function disableServers(folder: string, names: string[]) {
   await regenerateCodex(folder);
 }
 
+// Paseo 0.17 reports a button as failed after 30 seconds even if the work carries on, so a second
+// press could open a second chat or terminal. While a press is still being handled, another press
+// of the same button waits for it instead (2.4.4 review).
+const actionsRunning = new Set<string>();
 export async function runAction(paseo: Paseo, stepId: string, values: Record<string, string>): Promise<ActionResult> {
+  if (actionsRunning.has(stepId)) {
+    // An error, not a success, so the page keeps what was typed and does not act on it.
+    throw new Error("Still working on your last press of this button. Wait a moment, then press it again if nothing has changed.");
+  }
+  actionsRunning.add(stepId);
+  try {
+    return await runActionNow(paseo, stepId, values);
+  } finally {
+    actionsRunning.delete(stepId);
+  }
+}
+
+async function runActionNow(paseo: Paseo, stepId: string, values: Record<string, string>): Promise<ActionResult> {
   invalidateStatus();
   const openWorkspace = async () => {
     const workspace = await paseo.workspaces.open(await currentFolder());
@@ -1714,8 +1789,13 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
     return workspace;
   };
   const requireAccount = async () => {
-    const account = await claudeAccount();
+    const account = await claudeAccount(authBudget(ACTION_AUTH_BUDGET_MS));
     const state = await loadState();
+    // A chat starts only on a fresh answer: a saved one could belong to an account that has since
+    // signed out or switched (2.4.4 review).
+    if (account.checkFailed) {
+      throw new Error("Could not check your Claude sign-in just now. Try again in a moment.");
+    }
     if (account.loggedIn !== true || !(isManukoraTeam(account) || state.skipped.includes("claude-signin"))) {
       throw new Error("Sign in to your Manukora Claude account first.");
     }
@@ -1860,7 +1940,9 @@ export async function runAction(paseo: Paseo, stepId: string, values: Record<str
       // Signing in again: the step is already done, so it is not tracked as a hand-off (that would
       // clear at once and ask for a restart while the browser sign-in is still open). New chats start
       // a fresh Claude that reads the new sign-in, so no restart is needed.
-      if ((await claudeAccount()).loggedIn === true) {
+      // Only a fresh "signed in" skips the hand-off; if the check failed, track it like a first sign-in.
+      const current = await claudeAccount(authBudget(SIGNIN_AUTH_BUDGET_MS));
+      if (current.loggedIn === true && !current.checkFailed) {
         const opened = await openTerminal("Claude sign-in", "claude", ["auth", "login"], false);
         return { ...opened, message: "Opened Claude sign-in in a new terminal tab. Choose your Manukora account in the browser. When the terminal says you are signed in, press Check again and make sure this step shows your Manukora address; then start a new chat. No restart is needed." };
       }
